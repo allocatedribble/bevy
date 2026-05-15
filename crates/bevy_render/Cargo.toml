@@ -104,6 +104,7 @@ wgpu = { version = "29.0.3", default-features = false, features = [
   "fragile-send-sync-non-atomic-wasm",
 ] }
 wgpu-types = { version = "29.0.3", default-features = false }
+raw-window-handle = "0.6"
 naga = { version = "29.0.3", features = ["wgsl-in"] }
 bytemuck = { version = "1.5", features = ["derive", "must_cast"] }
 downcast-rs = { version = "2", default-features = false, features = ["std"] }

@@ -25,6 +25,7 @@ dfg_lut = ["bevy_image/ktx2", "bevy_image/zstd"]
 area_light_luts = ["bevy_image/ktx2", "bevy_image/zstd"]
 shader_format_glsl = ["bevy_shader/shader_format_glsl"]
 trace = ["bevy_render/trace"]
+mirage_meshlet_visibility_export = []
 # Enables the meshlet renderer for dense high-poly scenes (experimental)
 meshlet = ["dep:lz4_flex", "dep:range-alloc"]
 # Enables processing meshes into meshlet meshes

@@ -10,6 +10,8 @@ extern crate alloc;
 
 #[cfg(feature = "meshlet")]
 mod meshlet;
+#[cfg(feature = "mirage_meshlet_visibility_export")]
+pub mod mirage_meshlet_visibility_export;
 pub mod wireframe;
 
 /// Experimental features that are not yet finished. Please report any issues you encounter!

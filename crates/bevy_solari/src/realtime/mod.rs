@@ -16,6 +16,7 @@ use bevy_core_pipeline::{
 };
 use bevy_ecs::{component::Component, reflect::ReflectComponent, schedule::IntoScheduleConfigs};
 use bevy_pbr::DefaultOpaqueRendererMethod;
+use bevy_pbr::deferred::deferred_lighting;
 use bevy_reflect::{std_traits::ReflectDefault, Reflect};
 use bevy_render::{
     renderer::RenderDevice, ExtractSchedule, Render, RenderApp, RenderStartup, RenderSystems,
@@ -72,6 +73,7 @@ impl Plugin for SolariLightingPlugin {
             .add_systems(
                 Core3d,
                 solari_lighting
+                    .before(deferred_lighting)
                     .before(main_opaque_pass_3d)
                     .in_set(Core3dSystems::MainPass),
             );

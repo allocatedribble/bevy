@@ -60,6 +60,26 @@ pub fn upscaling(
         }
     };
 
+    let Some(pipeline) = pipeline_cache.get_render_pipeline(upscaling_target.0) else {
+        // we need to do some work on the swapchain to avoid pink screen uninit on macos
+        #[cfg(target_os = "macos")]
+        {
+            if let Some(out_attachment) = target.out_texture_color_attachment(converted_clear_color)
+            {
+                ctx.command_encoder()
+                    .begin_render_pass(&RenderPassDescriptor {
+                        label: Some("upscaling"),
+                        color_attachments: &[Some(out_attachment)],
+                        depth_stencil_attachment: None,
+                        timestamp_writes: None,
+                        occlusion_query_set: None,
+                        multiview_mask: None,
+                    });
+            }
+        }
+        return;
+    };
+
     let Some(out_attachment) = target.out_texture_color_attachment(converted_clear_color) else {
         return;
     };
@@ -71,13 +91,6 @@ pub fn upscaling(
         timestamp_writes: None,
         occlusion_query_set: None,
         multiview_mask: None,
-    };
-
-    let Some(pipeline) = pipeline_cache.get_render_pipeline(upscaling_target.0) else {
-        // we need to do some work on the swapchain to avoid pink screen uninit on macos
-        #[cfg(target_os = "macos")]
-        ctx.command_encoder().begin_render_pass(&pass_descriptor);
-        return;
     };
 
     let diagnostics = ctx.diagnostic_recorder();

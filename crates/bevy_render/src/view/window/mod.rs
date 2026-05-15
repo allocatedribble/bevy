@@ -17,6 +17,7 @@ use core::{
     num::NonZero,
     ops::{Deref, DerefMut},
 };
+use raw_window_handle::RawDisplayHandle;
 use wgpu::{
     SurfaceConfiguration, SurfaceTargetUnsafe, TextureFormat, TextureUsages, TextureViewDescriptor,
 };
@@ -153,7 +154,7 @@ fn extract_windows(
             swap_chain_texture_view_format: None,
             present_mode_changed: false,
             alpha_mode: window.composite_alpha_mode,
-            needs_initial_present: true,
+            needs_initial_present: needs_initial_present(handle),
         });
 
         if extracted_window.swap_chain_texture.is_none() {
@@ -197,6 +198,10 @@ fn extract_windows(
         extracted_windows.remove(&removed_window);
         window_surfaces.remove(&removed_window);
     }
+}
+
+fn needs_initial_present(handle: &RawHandleWrapper) -> bool {
+    matches!(handle.get_display_handle(), RawDisplayHandle::Wayland(_))
 }
 
 struct SurfaceData {
