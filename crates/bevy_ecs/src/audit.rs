@@ -81,6 +81,23 @@ mod imp {
         pub relationship_collection_scan_len: usize,
     }
 
+    #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+    pub struct StorageMetrics {
+        pub archetype_count: usize,
+        pub empty_archetype_count: usize,
+        pub archetype_edge_entries: usize,
+        pub archetype_edge_slots: usize,
+        pub table_count: usize,
+        pub empty_table_count: usize,
+        pub table_entity_count: usize,
+        pub table_entity_capacity: usize,
+        pub table_column_count: usize,
+        pub sparse_set_count: usize,
+        pub sparse_set_entity_count: usize,
+        pub sparse_set_entity_capacity: usize,
+        pub sparse_set_sparse_slots: usize,
+    }
+
     #[inline]
     fn add(counter: &AtomicUsize, value: usize) {
         counter.fetch_add(value, Ordering::Relaxed);
@@ -268,6 +285,25 @@ mod imp {
             relationship_collection_scan_len: load(&RELATIONSHIP_COLLECTION_SCAN_LEN),
         }
     }
+
+    pub fn storage_metrics(world: &crate::world::World) -> StorageMetrics {
+        let storages = world.storages();
+        StorageMetrics {
+            archetype_count: world.archetypes().len(),
+            empty_archetype_count: world.archetypes().audit_empty_count(),
+            archetype_edge_entries: world.archetypes().audit_edge_entries(),
+            archetype_edge_slots: world.archetypes().audit_edge_slots(),
+            table_count: storages.tables.len(),
+            empty_table_count: storages.tables.audit_empty_count(),
+            table_entity_count: storages.tables.audit_entity_count(),
+            table_entity_capacity: storages.tables.audit_entity_capacity(),
+            table_column_count: storages.tables.audit_column_count(),
+            sparse_set_count: storages.sparse_sets.len(),
+            sparse_set_entity_count: storages.sparse_sets.audit_entity_count(),
+            sparse_set_entity_capacity: storages.sparse_sets.audit_entity_capacity(),
+            sparse_set_sparse_slots: storages.sparse_sets.audit_sparse_slot_count(),
+        }
+    }
 }
 
 #[cfg(not(feature = "bevy_ecs_audit"))]
@@ -317,7 +353,7 @@ mod imp {
 pub(crate) use imp::*;
 
 #[cfg(feature = "bevy_ecs_audit")]
-pub use imp::{reset, snapshot, AuditCounters};
+pub use imp::{reset, snapshot, storage_metrics, AuditCounters, StorageMetrics};
 
 #[cfg(all(test, feature = "bevy_ecs_audit"))]
 mod tests {

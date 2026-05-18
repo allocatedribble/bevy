@@ -128,6 +128,16 @@ impl<I: SparseSetIndex, V> SparseArray<I, V> {
         self.values.clear();
     }
 
+    #[cfg(any(test, feature = "bevy_ecs_audit"))]
+    pub(crate) fn audit_slot_count(&self) -> usize {
+        self.values.len()
+    }
+
+    #[cfg(any(test, feature = "bevy_ecs_audit"))]
+    pub(crate) fn audit_entry_count(&self) -> usize {
+        self.values.iter().filter(|value| value.is_some()).count()
+    }
+
     /// Converts the [`SparseArray`] into an immutable variant.
     pub(crate) fn into_immutable(self) -> ImmutableSparseArray<I, V> {
         ImmutableSparseArray {
@@ -476,6 +486,59 @@ impl ComponentSparseSet {
     pub(crate) fn check_change_ticks(&mut self, check: CheckChangeTicks) {
         // SAFETY: This is using the valid size of the column.
         unsafe { self.dense.check_change_ticks(self.len(), check) };
+    }
+
+    #[cfg(any(test, feature = "bevy_ecs_audit"))]
+    pub(crate) fn audit_sparse_slot_count(&self) -> usize {
+        self.sparse.audit_slot_count()
+    }
+
+    #[cfg(any(test, feature = "bevy_ecs_audit"))]
+    pub(crate) fn audit_entity_capacity(&self) -> usize {
+        self.entities.capacity()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn audit_assert_dense_sparse_mappings(&self) {
+        assert_eq!(self.sparse.audit_entry_count(), self.entities.len());
+        for (dense_index, entity) in self.entities.iter().enumerate() {
+            #[cfg(debug_assertions)]
+            let entity_index = entity.index();
+            #[cfg(not(debug_assertions))]
+            let entity_index = *entity;
+
+            let sparse_row = self
+                .sparse
+                .get(entity_index)
+                .expect("dense sparse-set entity missing sparse row");
+            assert_eq!(sparse_row.index(), dense_index);
+        }
+        for (entity_index, dense_row) in
+            self.sparse
+                .values
+                .iter()
+                .enumerate()
+                .filter_map(|(entity_index, dense_row)| {
+                    dense_row
+                        .as_ref()
+                        .map(|dense_row| (entity_index, dense_row))
+                })
+        {
+            assert!(
+                dense_row.index() < self.entities.len(),
+                "sparse row points past dense storage"
+            );
+            #[cfg(debug_assertions)]
+            assert_eq!(
+                self.entities[dense_row.index()].index().index() as usize,
+                entity_index
+            );
+            #[cfg(not(debug_assertions))]
+            assert_eq!(
+                self.entities[dense_row.index()].index() as usize,
+                entity_index
+            );
+        }
     }
 }
 
@@ -853,6 +916,34 @@ impl SparseSets {
     pub(crate) fn check_change_ticks(&mut self, check: CheckChangeTicks) {
         for set in self.sets.values_mut() {
             set.check_change_ticks(check);
+        }
+    }
+
+    #[cfg(any(test, feature = "bevy_ecs_audit"))]
+    pub(crate) fn audit_entity_count(&self) -> usize {
+        self.sets.values().map(ComponentSparseSet::len).sum()
+    }
+
+    #[cfg(any(test, feature = "bevy_ecs_audit"))]
+    pub(crate) fn audit_entity_capacity(&self) -> usize {
+        self.sets
+            .values()
+            .map(ComponentSparseSet::audit_entity_capacity)
+            .sum()
+    }
+
+    #[cfg(any(test, feature = "bevy_ecs_audit"))]
+    pub(crate) fn audit_sparse_slot_count(&self) -> usize {
+        self.sets
+            .values()
+            .map(ComponentSparseSet::audit_sparse_slot_count)
+            .sum()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn audit_assert_dense_sparse_mappings(&self) {
+        for set in self.sets.values() {
+            set.audit_assert_dense_sparse_mappings();
         }
     }
 }

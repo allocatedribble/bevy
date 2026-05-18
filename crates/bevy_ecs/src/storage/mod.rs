@@ -25,6 +25,8 @@
 //! [`World`]: crate::world::World
 //! [`World::storages`]: crate::world::World::storages
 
+#[cfg(test)]
+mod audit_tests;
 mod blob_array;
 mod non_send;
 mod sparse_set;

@@ -723,6 +723,29 @@ impl Tables {
         }
     }
 
+    #[cfg(any(test, feature = "bevy_ecs_audit"))]
+    pub(crate) fn audit_empty_count(&self) -> usize {
+        self.tables.iter().filter(|table| table.is_empty()).count()
+    }
+
+    #[cfg(any(test, feature = "bevy_ecs_audit"))]
+    pub(crate) fn audit_entity_count(&self) -> usize {
+        self.tables
+            .iter()
+            .map(|table| table.entity_count() as usize)
+            .sum()
+    }
+
+    #[cfg(any(test, feature = "bevy_ecs_audit"))]
+    pub(crate) fn audit_entity_capacity(&self) -> usize {
+        self.tables.iter().map(Table::entity_capacity).sum()
+    }
+
+    #[cfg(any(test, feature = "bevy_ecs_audit"))]
+    pub(crate) fn audit_column_count(&self) -> usize {
+        self.tables.iter().map(Table::component_count).sum()
+    }
+
     /// Moves the `row` column values from `old_table_id` to a new row in `new_table_id`,
     /// for the columns shared between both tables.
     ///

@@ -315,6 +315,20 @@ impl Edges {
     ) {
         self.take_bundle.insert(bundle_id, archetype_id);
     }
+
+    #[cfg(any(test, feature = "bevy_ecs_audit"))]
+    pub(crate) fn audit_entry_count(&self) -> usize {
+        self.insert_bundle.audit_entry_count()
+            + self.remove_bundle.audit_entry_count()
+            + self.take_bundle.audit_entry_count()
+    }
+
+    #[cfg(any(test, feature = "bevy_ecs_audit"))]
+    pub(crate) fn audit_slot_count(&self) -> usize {
+        self.insert_bundle.audit_slot_count()
+            + self.remove_bundle.audit_slot_count()
+            + self.take_bundle.audit_slot_count()
+    }
 }
 
 /// Metadata about an [`Entity`] in a [`Archetype`].
@@ -944,6 +958,30 @@ impl Archetypes {
         for archetype in &mut self.archetypes {
             archetype.clear_entities();
         }
+    }
+
+    #[cfg(any(test, feature = "bevy_ecs_audit"))]
+    pub(crate) fn audit_empty_count(&self) -> usize {
+        self.archetypes
+            .iter()
+            .filter(|archetype| archetype.is_empty())
+            .count()
+    }
+
+    #[cfg(any(test, feature = "bevy_ecs_audit"))]
+    pub(crate) fn audit_edge_entries(&self) -> usize {
+        self.archetypes
+            .iter()
+            .map(|archetype| archetype.edges.audit_entry_count())
+            .sum()
+    }
+
+    #[cfg(any(test, feature = "bevy_ecs_audit"))]
+    pub(crate) fn audit_edge_slots(&self) -> usize {
+        self.archetypes
+            .iter()
+            .map(|archetype| archetype.edges.audit_slot_count())
+            .sum()
     }
 
     /// Get the component index
