@@ -34,6 +34,10 @@ mod imp {
         COMMAND_QUEUE_COMMANDS_PUSHED,
         COMMAND_QUEUE_APPLIES,
         COMMAND_QUEUE_RECURSIVE_APPLIES,
+        COMMAND_QUEUE_APPEND_CALLS,
+        COMMAND_QUEUE_BYTES_APPENDED,
+        COMMAND_QUEUE_REALLOCATIONS,
+        COMMAND_QUEUE_WORLD_FLUSHES,
         SCHEDULER_LOCK_FAILURES,
         SCHEDULER_READY_SCAN_PASSES,
         SCHEDULER_READY_SYSTEMS_SCANNED,
@@ -66,6 +70,10 @@ mod imp {
         pub command_queue_commands_pushed: usize,
         pub command_queue_applies: usize,
         pub command_queue_recursive_applies: usize,
+        pub command_queue_append_calls: usize,
+        pub command_queue_bytes_appended: usize,
+        pub command_queue_reallocations: usize,
+        pub command_queue_world_flushes: usize,
         pub scheduler_lock_failures: usize,
         pub scheduler_ready_scan_passes: usize,
         pub scheduler_ready_systems_scanned: usize,
@@ -201,6 +209,22 @@ mod imp {
     }
 
     #[inline]
+    pub(crate) fn command_queue_append(bytes: usize) {
+        inc(&COMMAND_QUEUE_APPEND_CALLS);
+        add(&COMMAND_QUEUE_BYTES_APPENDED, bytes);
+    }
+
+    #[inline]
+    pub(crate) fn command_queue_reallocation() {
+        inc(&COMMAND_QUEUE_REALLOCATIONS);
+    }
+
+    #[inline]
+    pub(crate) fn command_queue_world_flush() {
+        inc(&COMMAND_QUEUE_WORLD_FLUSHES);
+    }
+
+    #[inline]
     pub(crate) fn scheduler_lock_failed() {
         inc(&SCHEDULER_LOCK_FAILURES);
     }
@@ -270,6 +294,10 @@ mod imp {
             command_queue_commands_pushed: load(&COMMAND_QUEUE_COMMANDS_PUSHED),
             command_queue_applies: load(&COMMAND_QUEUE_APPLIES),
             command_queue_recursive_applies: load(&COMMAND_QUEUE_RECURSIVE_APPLIES),
+            command_queue_append_calls: load(&COMMAND_QUEUE_APPEND_CALLS),
+            command_queue_bytes_appended: load(&COMMAND_QUEUE_BYTES_APPENDED),
+            command_queue_reallocations: load(&COMMAND_QUEUE_REALLOCATIONS),
+            command_queue_world_flushes: load(&COMMAND_QUEUE_WORLD_FLUSHES),
             scheduler_lock_failures: load(&SCHEDULER_LOCK_FAILURES),
             scheduler_ready_scan_passes: load(&SCHEDULER_READY_SCAN_PASSES),
             scheduler_ready_systems_scanned: load(&SCHEDULER_READY_SYSTEMS_SCANNED),
@@ -331,6 +359,12 @@ mod imp {
     #[inline]
     pub(crate) fn command_queue_apply(_: usize, _: usize) {}
     #[inline]
+    pub(crate) fn command_queue_append(_: usize) {}
+    #[inline]
+    pub(crate) fn command_queue_reallocation() {}
+    #[inline]
+    pub(crate) fn command_queue_world_flush() {}
+    #[inline]
     pub(crate) fn scheduler_lock_failed() {}
     #[inline]
     pub(crate) fn scheduler_ready_scan(_: usize) {}
@@ -389,7 +423,16 @@ mod tests {
         queue.push(|world: &mut World| {
             world.spawn(TableComponent);
         });
+        let mut appended_queue = CommandQueue::default();
+        appended_queue.push(|world: &mut World| {
+            world.spawn(TableComponent);
+        });
+        queue.append(&mut appended_queue);
         queue.apply(&mut world);
+        world.commands().queue(|world: &mut World| {
+            world.spawn(TableComponent);
+        });
+        world.flush();
 
         world.add_observer(|_: On<AuditEvent>| {});
         world.trigger(AuditEvent);
@@ -402,6 +445,10 @@ mod tests {
         assert!(counters.sparse_set_removes > 0);
         assert!(counters.command_queue_commands_pushed >= 1);
         assert!(counters.command_queue_applies > 0);
+        assert!(counters.command_queue_append_calls > 0);
+        assert!(counters.command_queue_bytes_appended > 0);
+        assert!(counters.command_queue_reallocations > 0);
+        assert!(counters.command_queue_world_flushes > 0);
         assert!(counters.observer_dispatches >= 1);
         assert!(counters.observer_max_trigger_depth > 0);
     }

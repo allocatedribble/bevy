@@ -107,9 +107,9 @@ impl CommandQueue {
         }
     }
 
-    /// Take all commands from `other` and append them to `self`, leaving `other` empty
+    /// Take all unapplied commands from `other` and append them to `self`, leaving `other` empty.
     pub fn append(&mut self, other: &mut CommandQueue) {
-        self.bytes.append(&mut other.bytes);
+        append_unapplied_command_bytes(&mut self.bytes, other);
     }
 
     /// Returns false if there are any commands in the queue
@@ -152,6 +152,17 @@ impl RawCommandQueue {
     pub unsafe fn is_empty(&self) -> bool {
         // SAFETY: Pointers are guaranteed to be valid by requirements on `.clone_unsafe`
         (unsafe { *self.cursor.as_ref() }) >= (unsafe { self.bytes.as_ref() }).len()
+    }
+
+    /// Append all unapplied commands from `other` into this raw queue.
+    ///
+    /// # Safety
+    ///
+    /// * Caller ensures that `self` has not outlived the underlying queue
+    #[inline]
+    pub(crate) unsafe fn append(&mut self, other: &mut CommandQueue) {
+        // SAFETY: Required by this function's safety contract.
+        append_unapplied_command_bytes(unsafe { self.bytes.as_mut() }, other);
     }
 
     /// Push a [`Command`] onto the queue.
@@ -200,7 +211,11 @@ impl RawCommandQueue {
         let old_len = bytes.len();
 
         // Reserve enough bytes for both the metadata and the command itself.
+        let old_capacity = bytes.capacity();
         bytes.reserve(size_of::<Packed<C>>());
+        if bytes.capacity() != old_capacity {
+            crate::audit::command_queue_reallocation();
+        }
 
         // Pointer to the bytes at the end of the buffer.
         // SAFETY: We know it is within bounds of the allocation, due to the call to `.reserve()`.
@@ -322,6 +337,32 @@ impl RawCommandQueue {
     }
 }
 
+fn append_unapplied_command_bytes(target: &mut Vec<MaybeUninit<u8>>, other: &mut CommandQueue) {
+    debug_assert!(
+        other.cursor <= other.bytes.len(),
+        "CommandQueue cursor must never point past the byte buffer"
+    );
+    debug_assert!(
+        other.panic_recovery.is_empty(),
+        "CommandQueue panic recovery bytes are only valid during apply unwinding"
+    );
+
+    let cursor = other.cursor.min(other.bytes.len());
+    let appended_bytes = other.bytes.len() - cursor;
+    crate::audit::command_queue_append(appended_bytes);
+
+    if cursor == 0 {
+        target.append(&mut other.bytes);
+    } else if cursor < other.bytes.len() {
+        let unapplied = other.bytes.split_off(cursor);
+        other.bytes.clear();
+        target.extend(unapplied);
+    } else {
+        other.bytes.clear();
+    }
+    other.cursor = 0;
+}
+
 impl Drop for CommandQueue {
     fn drop(&mut self) {
         if !self.bytes.is_empty() {
@@ -354,9 +395,13 @@ impl SystemBuffer for CommandQueue {
 mod test {
     use super::*;
     use crate::{component::Component, resource::Resource};
-    use alloc::{borrow::ToOwned, string::String, sync::Arc};
+    #[cfg(feature = "std")]
+    use alloc::borrow::ToOwned;
+    use alloc::{string::String, sync::Arc};
+    #[cfg(feature = "std")]
+    use core::panic::AssertUnwindSafe;
     use core::{
-        panic::AssertUnwindSafe,
+        mem::align_of,
         sync::atomic::{AtomicU32, Ordering},
     };
 
@@ -382,6 +427,23 @@ mod test {
         type Out = ();
 
         fn apply(self, _: &mut World) {}
+    }
+
+    #[derive(Resource, Default)]
+    struct Order(Vec<usize>);
+
+    fn add_order(index: usize) -> impl Command<Out = ()> {
+        move |world: &mut World| world.resource_mut::<Order>().0.push(index)
+    }
+
+    fn partially_consumed_order_queue() -> CommandQueue {
+        let mut queue = CommandQueue::default();
+        queue.push(add_order(1));
+        let cursor_after_first = queue.bytes.len();
+        queue.push(add_order(2));
+        queue.push(add_order(3));
+        queue.cursor = cursor_after_first;
+        queue
     }
 
     #[test]
@@ -456,6 +518,51 @@ mod test {
         assert_eq!(world.query::<&A>().query(&world).count(), 2);
     }
 
+    #[test]
+    fn append_partially_consumed_queue_moves_only_unapplied_commands() {
+        let mut world = World::new();
+        world.init_resource::<Order>();
+
+        let mut source = partially_consumed_order_queue();
+        let mut destination = CommandQueue::default();
+        destination.append(&mut source);
+
+        assert!(source.is_empty());
+        destination.apply(&mut world);
+        assert_eq!(&world.resource::<Order>().0, &[2, 3]);
+    }
+
+    #[test]
+    fn raw_commands_append_partially_consumed_queue_moves_only_unapplied_commands() {
+        let mut world = World::new();
+        world.init_resource::<Order>();
+
+        let mut source = partially_consumed_order_queue();
+        world.commands().append(&mut source);
+
+        assert!(source.is_empty());
+        world.flush();
+        assert_eq!(&world.resource::<Order>().0, &[2, 3]);
+    }
+
+    #[test]
+    fn append_fully_consumed_queue_appends_nothing_and_resets_source() {
+        let mut world = World::new();
+        world.init_resource::<Order>();
+
+        let mut source = CommandQueue::default();
+        source.push(add_order(1));
+        source.cursor = source.bytes.len();
+
+        let mut destination = CommandQueue::default();
+        destination.append(&mut source);
+
+        assert!(source.is_empty());
+        assert!(destination.is_empty());
+        destination.apply(&mut world);
+        assert!(world.resource::<Order>().0.is_empty());
+    }
+
     #[expect(
         dead_code,
         reason = "The inner string is used to ensure that, when the PanicCommand gets pushed to the queue, some data is written to the `bytes` vector."
@@ -469,6 +576,7 @@ mod test {
         }
     }
 
+    #[cfg(feature = "std")]
     #[test]
     fn test_command_queue_inner_panic_safe() {
         std::panic::set_hook(Box::new(|_| {}));
@@ -492,35 +600,185 @@ mod test {
         assert_eq!(world.query::<&A>().query(&world).count(), 3);
     }
 
+    #[cfg(feature = "std")]
     #[test]
     fn test_command_queue_inner_nested_panic_safe() {
         std::panic::set_hook(Box::new(|_| {}));
 
-        #[derive(Resource, Default)]
-        struct Order(Vec<usize>);
-
         let mut world = World::new();
         world.init_resource::<Order>();
 
-        fn add_index(index: usize) -> impl Command {
-            move |world: &mut World| world.resource_mut::<Order>().0.push(index)
-        }
-        world.commands().queue(add_index(1));
+        world.commands().queue(add_order(1));
         world.commands().queue(|world: &mut World| {
-            world.commands().queue(add_index(2));
+            world.commands().queue(add_order(2));
             world.commands().queue(PanicCommand("I panic!".to_owned()));
-            world.commands().queue(add_index(3));
+            world.commands().queue(add_order(3));
             world.flush_commands();
         });
-        world.commands().queue(add_index(4));
+        world.commands().queue(add_order(4));
 
         let _ = std::panic::catch_unwind(AssertUnwindSafe(|| {
             world.flush_commands();
         }));
 
-        world.commands().queue(add_index(5));
+        world.commands().queue(add_order(5));
         world.flush_commands();
         assert_eq!(&world.resource::<Order>().0, &[1, 2, 3, 4, 5]);
+    }
+
+    #[test]
+    fn command_can_enqueue_and_recursively_flush_commands() {
+        let mut world = World::new();
+        world.init_resource::<Order>();
+
+        world.commands().queue(|world: &mut World| {
+            world.resource_mut::<Order>().0.push(1);
+            world.commands().queue(add_order(2));
+            world.flush();
+            world.resource_mut::<Order>().0.push(3);
+        });
+        world.flush();
+
+        assert_eq!(&world.resource::<Order>().0, &[1, 2, 3]);
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn command_panics_after_enqueueing_command_preserves_unapplied_commands() {
+        std::panic::set_hook(Box::new(|_| {}));
+
+        let mut world = World::new();
+        world.init_resource::<Order>();
+        world.commands().queue(add_order(1));
+        world.commands().queue(|world: &mut World| {
+            world.commands().queue(add_order(2));
+            panic!("command panicked after enqueueing another command");
+        });
+        world.commands().queue(add_order(3));
+
+        let _ = std::panic::catch_unwind(AssertUnwindSafe(|| world.flush()));
+        assert_eq!(&world.resource::<Order>().0, &[1]);
+
+        world.commands().queue(add_order(4));
+        world.flush();
+        assert_eq!(&world.resource::<Order>().0, &[1, 3, 2, 4]);
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn command_panics_before_enqueueing_command_preserves_only_existing_unapplied_commands() {
+        std::panic::set_hook(Box::new(|_| {}));
+
+        let mut world = World::new();
+        world.init_resource::<Order>();
+        world.commands().queue(add_order(1));
+        world.commands().queue(|world: &mut World| {
+            if world.resource::<Order>().0.len() == 1 {
+                panic!("command panicked before enqueueing another command");
+            }
+            world.commands().queue(add_order(2));
+        });
+        world.commands().queue(add_order(3));
+
+        let _ = std::panic::catch_unwind(AssertUnwindSafe(|| world.flush()));
+        assert_eq!(&world.resource::<Order>().0, &[1]);
+
+        world.commands().queue(add_order(4));
+        world.flush();
+        assert_eq!(&world.resource::<Order>().0, &[1, 3, 4]);
+    }
+
+    #[derive(Resource, Default)]
+    struct PayloadAudit {
+        zst_count: usize,
+        large_checksum: u32,
+    }
+
+    struct ZstCommand;
+
+    impl Command for ZstCommand {
+        type Out = ();
+
+        fn apply(self, world: &mut World) {
+            world.resource_mut::<PayloadAudit>().zst_count += 1;
+        }
+    }
+
+    struct LargeCommand {
+        bytes: [u8; 16 * 1024],
+    }
+
+    impl Command for LargeCommand {
+        type Out = ();
+
+        fn apply(self, world: &mut World) {
+            world.resource_mut::<PayloadAudit>().large_checksum =
+                self.bytes.iter().map(|byte| *byte as u32).sum();
+        }
+    }
+
+    #[repr(align(128))]
+    struct AlignedCommand {
+        applied: Arc<AtomicU32>,
+    }
+
+    impl Command for AlignedCommand {
+        type Out = ();
+
+        fn apply(self, _: &mut World) {
+            assert_eq!((&self as *const Self as usize) % align_of::<Self>(), 0);
+            self.applied.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    struct DropCountCommand {
+        applied: Arc<AtomicU32>,
+        dropped: Arc<AtomicU32>,
+    }
+
+    impl Drop for DropCountCommand {
+        fn drop(&mut self) {
+            self.dropped.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    impl Command for DropCountCommand {
+        type Out = ();
+
+        fn apply(self, _: &mut World) {
+            self.applied.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    #[test]
+    fn command_queue_handles_zst_large_aligned_and_drop_payloads() {
+        let mut world = World::new();
+        world.init_resource::<PayloadAudit>();
+        let aligned_applied = Arc::new(AtomicU32::new(0));
+        let drop_applied = Arc::new(AtomicU32::new(0));
+        let dropped = Arc::new(AtomicU32::new(0));
+
+        let mut queue = CommandQueue::default();
+        queue.push(ZstCommand);
+        queue.push(LargeCommand {
+            bytes: [7; 16 * 1024],
+        });
+        queue.push(AlignedCommand {
+            applied: aligned_applied.clone(),
+        });
+        queue.push(DropCountCommand {
+            applied: drop_applied.clone(),
+            dropped: dropped.clone(),
+        });
+
+        queue.apply(&mut world);
+
+        let audit = world.resource::<PayloadAudit>();
+        assert_eq!(audit.zst_count, 1);
+        assert_eq!(audit.large_checksum, 7 * 16 * 1024);
+        assert_eq!(aligned_applied.load(Ordering::Relaxed), 1);
+        assert_eq!(drop_applied.load(Ordering::Relaxed), 1);
+        assert_eq!(dropped.load(Ordering::Relaxed), 1);
     }
 
     // NOTE: `CommandQueue` is `Send` because `Command` is send.

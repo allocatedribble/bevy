@@ -1,8 +1,8 @@
 use bevy_ecs::{
     hierarchy::ChildOf,
     prelude::*,
-    schedule::{MultiThreadedExecutor, Schedule, SingleThreadedExecutor},
-    system::{Command, Commands},
+    schedule::{ApplyDeferred, MultiThreadedExecutor, Schedule, SingleThreadedExecutor},
+    system::{Command, Commands, ParallelCommands},
     world::{CommandQueue, World},
 };
 use core::hint::black_box;
@@ -109,7 +109,39 @@ impl Command for FakeCommand {
     }
 }
 
+struct NestedCommand(u64);
+
+impl Command for NestedCommand {
+    type Out = ();
+
+    fn apply(self, world: &mut World) {
+        world.commands().queue(FakeCommand(self.0));
+    }
+}
+
+struct LargeCommand([u8; 4096]);
+
+impl Command for LargeCommand {
+    type Out = ();
+
+    fn apply(self, world: &mut World) {
+        black_box((self.0[0], world.entities().len()));
+    }
+}
+
 fn tiny_system() {}
+
+fn queue_spawn_command(mut commands: Commands) {
+    commands.spawn(TableOnly(1));
+}
+
+fn parallel_command_system(query: Query<Entity, With<TableOnly>>, par_commands: ParallelCommands) {
+    query.par_iter().for_each(|entity| {
+        par_commands.command_scope(|mut commands| {
+            commands.entity(entity).insert(TransitionMarker);
+        });
+    });
+}
 
 fn add_archetype_bits(world: &mut World, count: usize) {
     for i in 0..count {
@@ -324,6 +356,218 @@ fn command_storm(c: &mut Criterion) {
                         commands.queue(FakeCommand(i as u64));
                     }
                     queue.apply(&mut world);
+                });
+            },
+        );
+    }
+
+    group.finish();
+}
+
+fn command_structural_patterns(c: &mut Criterion) {
+    let mut group = c.benchmark_group("ecs_microscope/command_structural_patterns");
+    group.warm_up_time(core::time::Duration::from_millis(250));
+    group.measurement_time(core::time::Duration::from_secs(2));
+    group.sample_size(30);
+
+    for command_count in [100, 1_000, 10_000] {
+        group.bench_with_input(
+            BenchmarkId::new("commands_spawn_one_by_one", command_count),
+            &command_count,
+            |bencher, &command_count| {
+                bencher.iter_batched(
+                    World::new,
+                    |mut world| {
+                        let mut queue = CommandQueue::default();
+                        {
+                            let mut commands = Commands::new(&mut queue, &world);
+                            for i in 0..command_count {
+                                commands.spawn(TableOnly(i as u32));
+                            }
+                        }
+                        queue.apply(&mut world);
+                        black_box(world.entities().len());
+                    },
+                    BatchSize::LargeInput,
+                );
+            },
+        );
+
+        group.bench_with_input(
+            BenchmarkId::new("commands_spawn_batch", command_count),
+            &command_count,
+            |bencher, &command_count| {
+                bencher.iter_batched(
+                    World::new,
+                    |mut world| {
+                        let mut queue = CommandQueue::default();
+                        Commands::new(&mut queue, &world)
+                            .spawn_batch((0..command_count).map(|i| TableOnly(i as u32)));
+                        queue.apply(&mut world);
+                        black_box(world.entities().len());
+                    },
+                    BatchSize::LargeInput,
+                );
+            },
+        );
+
+        group.bench_with_input(
+            BenchmarkId::new("mixed_spawn_insert_remove_despawn", command_count),
+            &command_count,
+            |bencher, &command_count| {
+                bencher.iter_batched(
+                    World::new,
+                    |mut world| {
+                        let mut queue = CommandQueue::default();
+                        {
+                            let mut commands = Commands::new(&mut queue, &world);
+                            for i in 0..command_count {
+                                let entity = commands.spawn(TableOnly(i as u32)).id();
+                                commands.entity(entity).insert(Sparse(i as u32));
+                                commands.entity(entity).remove::<Sparse>();
+                                if i % 4 == 0 {
+                                    commands.entity(entity).despawn();
+                                }
+                            }
+                        }
+                        queue.apply(&mut world);
+                        black_box(world.entities().len());
+                    },
+                    BatchSize::LargeInput,
+                );
+            },
+        );
+    }
+
+    group.finish();
+}
+
+fn command_payload_and_append(c: &mut Criterion) {
+    let mut group = c.benchmark_group("ecs_microscope/command_payload_append");
+    group.warm_up_time(core::time::Duration::from_millis(250));
+    group.measurement_time(core::time::Duration::from_secs(2));
+    group.sample_size(30);
+
+    for command_count in [100, 1_000, 10_000] {
+        group.bench_with_input(
+            BenchmarkId::new("many_tiny_commands", command_count),
+            &command_count,
+            |bencher, &command_count| {
+                let mut world = World::new();
+                bencher.iter(|| {
+                    let mut queue = CommandQueue::default();
+                    for i in 0..command_count {
+                        queue.push(FakeCommand(i as u64));
+                    }
+                    queue.apply(&mut world);
+                });
+            },
+        );
+
+        group.bench_with_input(
+            BenchmarkId::new("nested_commands", command_count),
+            &command_count,
+            |bencher, &command_count| {
+                let mut world = World::new();
+                bencher.iter(|| {
+                    let mut queue = CommandQueue::default();
+                    for i in 0..command_count {
+                        queue.push(NestedCommand(i as u64));
+                    }
+                    queue.apply(&mut world);
+                });
+            },
+        );
+    }
+
+    for command_count in [10, 100] {
+        group.bench_with_input(
+            BenchmarkId::new("few_large_commands", command_count),
+            &command_count,
+            |bencher, &command_count| {
+                let mut world = World::new();
+                bencher.iter(|| {
+                    let mut queue = CommandQueue::default();
+                    for _ in 0..command_count {
+                        queue.push(LargeCommand([7; 4096]));
+                    }
+                    queue.apply(&mut world);
+                });
+            },
+        );
+    }
+
+    for queue_count in [10, 100, 1_000] {
+        group.bench_with_input(
+            BenchmarkId::new("append_many_queues", queue_count),
+            &queue_count,
+            |bencher, &queue_count| {
+                bencher.iter_batched(
+                    || {
+                        let queues = (0..queue_count)
+                            .map(|i| {
+                                let mut queue = CommandQueue::default();
+                                queue.push(FakeCommand(i as u64));
+                                queue
+                            })
+                            .collect::<Vec<_>>();
+                        (World::new(), queues)
+                    },
+                    |(mut world, mut queues)| {
+                        let mut combined = CommandQueue::default();
+                        for queue in &mut queues {
+                            combined.append(queue);
+                        }
+                        combined.apply(&mut world);
+                    },
+                    BatchSize::LargeInput,
+                );
+            },
+        );
+    }
+
+    group.finish();
+}
+
+fn parallel_and_apply_deferred_commands(c: &mut Criterion) {
+    let mut group = c.benchmark_group("ecs_microscope/parallel_apply_deferred_commands");
+    group.warm_up_time(core::time::Duration::from_millis(250));
+    group.measurement_time(core::time::Duration::from_secs(2));
+    group.sample_size(20);
+
+    for entity_count in [1_000, 10_000] {
+        group.bench_with_input(
+            BenchmarkId::new("parallel_commands_insert", entity_count),
+            &entity_count,
+            |bencher, &entity_count| {
+                let mut world = World::new();
+                world.spawn_batch((0..entity_count).map(|i| TableOnly(i as u32)));
+                let mut schedule = Schedule::default();
+                schedule.add_systems(parallel_command_system);
+                schedule.run(&mut world);
+                let mut marker_query = world.query::<&TransitionMarker>();
+                bencher.iter(|| {
+                    schedule.run(&mut world);
+                    black_box(marker_query.query(&world).count());
+                });
+            },
+        );
+    }
+
+    for barrier_count in [1, 4, 16] {
+        group.bench_with_input(
+            BenchmarkId::new("explicit_apply_deferred_barriers", barrier_count),
+            &barrier_count,
+            |bencher, &barrier_count| {
+                let mut world = World::new();
+                let mut schedule = Schedule::default();
+                for _ in 0..barrier_count {
+                    schedule.add_systems((queue_spawn_command, ApplyDeferred).chain());
+                }
+                schedule.run(&mut world);
+                bencher.iter(|| {
+                    schedule.run(&mut world);
+                    black_box(world.entities().len());
                 });
             },
         );
@@ -645,6 +889,9 @@ criterion_group!(
     query_update_archetypes,
     optional_sparse_query,
     command_storm,
+    command_structural_patterns,
+    command_payload_and_append,
+    parallel_and_apply_deferred_commands,
     storage_churn,
     storage_row_moves_and_growth,
     archetype_churn_and_empty_cache,

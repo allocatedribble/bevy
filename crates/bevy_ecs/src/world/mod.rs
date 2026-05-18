@@ -3035,6 +3035,7 @@ impl World {
     pub(crate) fn flush_commands(&mut self) {
         // SAFETY: `self.command_queue` is only de-allocated in `World`'s `Drop`
         if !unsafe { self.command_queue.is_empty() } {
+            crate::audit::command_queue_world_flush();
             // SAFETY: `self.command_queue` is only de-allocated in `World`'s `Drop`
             unsafe {
                 self.command_queue
