@@ -34,6 +34,9 @@ backtrace = ["std"]
 
 # Debugging Features
 
+## Internal ECS audit counters for benchmark and microscope passes.
+bevy_ecs_audit = []
+
 ## Enables `tracing` integration, allowing spans and other metrics to be reported
 ## through that framework.
 trace = ["std", "dep:tracing"]

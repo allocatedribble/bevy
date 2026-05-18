@@ -13,6 +13,9 @@ autobenches = false
 criterion = { version = "0.8.0", features = ["html_reports"] }
 seq-macro = "0.3.6"
 
+[features]
+ecs_audit = ["bevy_ecs/bevy_ecs_audit"]
+
 [dev-dependencies]
 # Bevy crates
 bevy_app = { path = "../crates/bevy_app" }
@@ -80,6 +83,11 @@ bench = false
 [[bench]]
 name = "ecs"
 path = "benches/bevy_ecs/main.rs"
+harness = false
+
+[[bench]]
+name = "ecs_microscope"
+path = "benches/bevy_ecs_microscope/main.rs"
 harness = false
 
 [[bench]]

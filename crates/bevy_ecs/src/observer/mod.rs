@@ -168,11 +168,13 @@ impl World {
             world.as_unsafe_world_cell().increment_trigger_id();
         }
 
+        let _audit_trigger = crate::audit::observer_trigger_scope();
         for (observer, runner) in observers.global_observers() {
             // SAFETY:
             // - `observers` come from `world` and correspond to `event_key`
             // - caller guarantees `event_data` and `trigger_data` are valid
             unsafe {
+                crate::audit::observer_dispatch();
                 (runner)(
                     world.reborrow(),
                     *observer,
@@ -286,6 +288,7 @@ impl World {
                 for (observer, runner) in component_observers.global_observers() {
                     // SAFETY: same as above, caller guarantees data validity
                     unsafe {
+                        crate::audit::observer_dispatch();
                         (runner)(
                             world.reborrow(),
                             *observer,
@@ -303,6 +306,7 @@ impl World {
                     for (observer, runner) in map {
                         // SAFETY: same as above, caller guarantees data validity
                         unsafe {
+                            crate::audit::observer_dispatch();
                             (runner)(
                                 world.reborrow(),
                                 *observer,

@@ -27,6 +27,11 @@ extern crate alloc;
 extern crate self as bevy_ecs;
 
 pub mod archetype;
+#[cfg(feature = "bevy_ecs_audit")]
+#[doc(hidden)]
+pub mod audit;
+#[cfg(not(feature = "bevy_ecs_audit"))]
+pub(crate) mod audit;
 pub mod batching;
 pub mod bundle;
 pub mod change_detection;

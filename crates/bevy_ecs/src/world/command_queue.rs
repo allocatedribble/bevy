@@ -222,6 +222,7 @@ impl RawCommandQueue {
         unsafe {
             bytes.set_len(old_len + size_of::<Packed<C>>());
         }
+        crate::audit::command_queue_push(size_of::<Packed<C>>());
     }
 
     /// If `world` is [`Some`], this will apply the queued [commands](`Command`).
@@ -237,6 +238,7 @@ impl RawCommandQueue {
         // If this is not the command queue on world we have exclusive ownership and self will not be mutated
         let start = *self.cursor.as_ref();
         let stop = self.bytes.as_ref().len();
+        crate::audit::command_queue_apply(start, stop);
         let mut local_cursor = start;
         // SAFETY: we are setting the global cursor to the current length to prevent the executing commands from applying
         // the remaining commands currently in this list. This is safe.

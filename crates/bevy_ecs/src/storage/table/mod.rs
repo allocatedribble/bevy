@@ -225,6 +225,7 @@ impl Table {
     /// `row` must be in-bounds (`row.as_usize()` < `self.len()`)
     pub(crate) unsafe fn swap_remove_unchecked(&mut self, row: TableRow) -> Option<Entity> {
         debug_assert!(row.index_u32() < self.entity_count());
+        crate::audit::table_swap_remove();
         let last_element_index = self.entity_count() - 1;
         if row.index_u32() != last_element_index {
             // Instead of checking this condition on every `swap_remove` call, we
@@ -490,6 +491,7 @@ impl Table {
     ///
     /// The allocated row must be written to immediately with valid values in each column
     pub(crate) unsafe fn allocate(&mut self, entity: Entity) -> TableRow {
+        crate::audit::table_allocate();
         self.reserve(1);
         let len = self.entity_count();
         // SAFETY: No entity index may be in more than one table row at once, so there are no duplicates,
@@ -755,6 +757,7 @@ impl Tables {
     ) -> TableMoveResult<'_> {
         #[cfg(debug_assertions)]
         debug_assert!(old_table_id != new_table_id);
+        crate::audit::table_move_row();
         // SAFETY:
         // - The caller ensures `old_table_id` and `new_table_id` do not overlap.
         // - The caller ensures `old_table_id` and `new_table_id` are in-bounds.

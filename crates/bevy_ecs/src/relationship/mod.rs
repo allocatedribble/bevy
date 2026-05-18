@@ -196,11 +196,15 @@ pub trait Relationship: Component + Sized {
             entity_commands
                 .entry::<Self::RelationshipTarget>()
                 .and_modify(move |mut relationship_target| {
-                    relationship_target.collection_mut_risky().add(entity);
+                    let collection = relationship_target.collection_mut_risky();
+                    let scan_len = collection.len();
+                    collection.add(entity);
+                    crate::audit::relationship_add(scan_len);
                 })
                 .or_insert_with(move || {
                     let mut target = Self::RelationshipTarget::with_capacity(1);
                     target.collection_mut_risky().add(entity);
+                    crate::audit::relationship_add(0);
                     target
                 });
         } else {
@@ -238,7 +242,10 @@ pub trait Relationship: Component + Sized {
             && let Some(mut relationship_target) =
                 target_entity_mut.get_mut::<Self::RelationshipTarget>()
         {
-            relationship_target.collection_mut_risky().remove(entity);
+            let collection = relationship_target.collection_mut_risky();
+            let scan_len = collection.len();
+            collection.remove(entity);
+            crate::audit::relationship_remove(scan_len);
             if relationship_target.len() == 0 {
                 let command = |mut entity: EntityWorldMut| {
                     // this "remove" operation must check emptiness because in the event that an identical

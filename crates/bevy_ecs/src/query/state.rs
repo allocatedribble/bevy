@@ -564,17 +564,21 @@ impl<D: QueryData, F: QueryFilter> QueryState<D, F> {
             let archetypes = world.archetypes();
             let old_generation =
                 core::mem::replace(&mut self.archetype_generation, archetypes.generation());
+            let mut scanned = 0;
 
             for archetype in &archetypes[old_generation..] {
+                scanned += 1;
                 // SAFETY: The validate_world call ensures that the world is the same the QueryState
                 // was initialized from.
                 unsafe {
                     self.new_archetype(archetype);
                 }
             }
+            crate::audit::query_update_archetypes(scanned);
         } else {
             // skip if we are already up to date
             if self.archetype_generation == world.archetypes().generation() {
+                crate::audit::query_update_archetypes(0);
                 return;
             }
             // if there are required components, we can optimize by only iterating through archetypes
@@ -592,12 +596,14 @@ impl<D: QueryData, F: QueryFilter> QueryState<D, F> {
                 })
                 // select the component with the fewest archetypes
                 .min_by_key(ExactSizeIterator::len);
+            let mut scanned = 0;
             if let Some(archetypes) = potential_archetypes {
                 for archetype_id in archetypes {
                     // exclude archetypes that have already been processed
                     if archetype_id < &self.archetype_generation.0 {
                         continue;
                     }
+                    scanned += 1;
                     // SAFETY: get_potential_archetypes only returns archetype ids that are valid for the world
                     let archetype = &world.archetypes()[*archetype_id];
                     // SAFETY: The validate_world call ensures that the world is the same the QueryState
@@ -608,6 +614,7 @@ impl<D: QueryData, F: QueryFilter> QueryState<D, F> {
                 }
             }
             self.archetype_generation = world.archetypes().generation();
+            crate::audit::query_update_archetypes(scanned);
         }
     }
 
@@ -642,9 +649,12 @@ impl<D: QueryData, F: QueryFilter> QueryState<D, F> {
             && F::matches_component_set(&self.filter_state, &|id| archetype.contains(id))
             && self.matches_component_set(&|id| archetype.contains(id))
         {
+            let mut matched_archetype = false;
+            let mut matched_table = false;
             let archetype_index = archetype.id().index();
             if !self.matched_archetypes.contains(archetype_index) {
                 self.matched_archetypes.grow_and_insert(archetype_index);
+                matched_archetype = true;
                 if !self.is_dense {
                     self.matched_storage_ids.push(StorageId {
                         archetype_id: archetype.id(),
@@ -654,12 +664,16 @@ impl<D: QueryData, F: QueryFilter> QueryState<D, F> {
             let table_index = archetype.table_id().as_usize();
             if !self.matched_tables.contains(table_index) {
                 self.matched_tables.grow_and_insert(table_index);
+                matched_table = true;
                 if self.is_dense {
                     self.matched_storage_ids.push(StorageId {
                         table_id: archetype.table_id(),
                     });
                 }
             }
+            crate::audit::query_new_archetype(matched_archetype, matched_table);
+        } else {
+            crate::audit::query_new_archetype(false, false);
         }
     }
 

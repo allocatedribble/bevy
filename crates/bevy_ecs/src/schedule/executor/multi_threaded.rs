@@ -353,7 +353,10 @@ impl<'scope, 'env: 'scope, 'sys> Context<'scope, 'env, 'sys> {
         reason = "Field is only accessed here and is guarded by lock with a documented safety comment"
     )]
     fn try_lock<'a>(&'a self) -> Option<(&'a mut Conditions<'sys>, MutexGuard<'a, ExecutorState>)> {
-        let guard = self.environment.executor.state.try_lock().ok()?;
+        let Ok(guard) = self.environment.executor.state.try_lock() else {
+            crate::audit::scheduler_lock_failed();
+            return None;
+        };
         // SAFETY: This is an exclusive access as no other location fetches conditions mutably, and
         // is synchronized by the lock on the executor state.
         let conditions = unsafe { &mut *self.environment.conditions.get() };
@@ -469,6 +472,7 @@ impl ExecutorState {
             check_for_new_ready_systems = false;
 
             ready_systems.clone_from(&self.ready_systems);
+            crate::audit::scheduler_ready_scan(ready_systems.count_ones(..));
 
             for system_index in ready_systems.ones() {
                 debug_assert!(!self.running_systems.contains(system_index));
@@ -780,7 +784,10 @@ fn apply_deferred(
     systems: &[SyncUnsafeCell<SystemWithAccess>],
     world: &mut World,
 ) -> Result<(), Box<dyn Any + Send>> {
+    let audit_start = std::time::Instant::now();
+    let mut audit_system_count = 0;
     for system_index in unapplied_systems.ones() {
+        audit_system_count += 1;
         // SAFETY: none of these systems are running, no other references exist
         let system = &mut unsafe { &mut *systems[system_index].get() }.system;
         let res = std::panic::catch_unwind(AssertUnwindSafe(|| {
@@ -798,6 +805,10 @@ fn apply_deferred(
             return Err(payload);
         }
     }
+    crate::audit::apply_deferred_finished(
+        audit_system_count,
+        audit_start.elapsed().as_nanos().min(usize::MAX as u128) as usize,
+    );
     Ok(())
 }
 
@@ -811,6 +822,7 @@ unsafe fn evaluate_and_fold_conditions(
     for_system: &ScheduleSystem,
     on_set: bool,
 ) -> bool {
+    crate::audit::scheduler_condition_evaluations(conditions.len());
     #[expect(
         clippy::unnecessary_fold,
         reason = "Short-circuiting here would prevent conditions from mutating their own state as needed."
