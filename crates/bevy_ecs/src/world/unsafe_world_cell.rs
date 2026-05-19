@@ -1439,4 +1439,16 @@ mod tests {
         // SAFETY: this invalid usage will be caught by a runtime panic.
         let _ = unsafe { entity_cell.get_mut::<C>() };
     }
+
+    #[test]
+    #[should_panic = "is forbidden"]
+    fn as_unsafe_world_cell_readonly_component_mut_by_id_forbidden() {
+        let mut world = World::new();
+        let component_id = world.register_component::<C>();
+        let entity = world.spawn(C).id();
+        let world_cell = world.as_unsafe_world_cell_readonly();
+        let entity_cell = world_cell.get_entity(entity).unwrap();
+        // SAFETY: this invalid untyped mutable access is rejected by the readonly world cell.
+        let _ = unsafe { entity_cell.get_mut_by_id(component_id) };
+    }
 }

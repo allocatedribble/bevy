@@ -2289,6 +2289,24 @@ mod tests {
     }
 
     #[test]
+    fn unchecked_query_fetch_after_archetype_update_sees_moved_entity() {
+        let mut world = World::new();
+        let entity = world.spawn(A(7)).id();
+        let mut query = world.query::<&A>();
+        assert_eq!(query.single(&world).unwrap().0, 7);
+
+        world.entity_mut(entity).insert(B(11));
+
+        // SAFETY: this is a read-only query over a world cell that only permits read-only access.
+        let fetched =
+            unsafe { query.get_unchecked(world.as_unsafe_world_cell_readonly(), entity) }.unwrap();
+        assert_eq!(fetched.0, 7);
+
+        query.update_archetypes(&world);
+        assert_eq!(query.get_manual(&world, entity).unwrap().0, 7);
+    }
+
+    #[test]
     fn join() {
         let mut world = World::new();
         world.spawn(A(0));

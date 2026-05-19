@@ -63,6 +63,18 @@ impl Drop for DropAudit {
 }
 
 #[derive(Component)]
+#[component(storage = "SparseSet")]
+struct SparseDropAudit {
+    drops: Arc<AtomicUsize>,
+}
+
+impl Drop for SparseDropAudit {
+    fn drop(&mut self) {
+        self.drops.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+#[derive(Component)]
 struct PanicOnDrop {
     drops: Arc<AtomicUsize>,
 }
@@ -506,6 +518,79 @@ fn high_entity_index_sparse_storage_reports_sparse_slots_and_clears() {
     world.clear_entities();
     assert_eq!(world.storages.sparse_sets.audit_entity_count(), 0);
     assert_eq!(world.storages.sparse_sets.audit_sparse_slot_count(), 0);
+}
+
+#[test]
+fn table_row_move_updates_swapped_entity_location() {
+    let mut world = World::new();
+    let first = world.spawn((DenseA(0), DenseB(0))).id();
+    let middle = world.spawn((DenseA(1), DenseB(1))).id();
+    let last = world.spawn((DenseA(2), DenseB(2))).id();
+
+    let first_location = world.entities().get_spawned(first).unwrap();
+    let last_location = world.entities().get_spawned(last).unwrap();
+    assert_eq!(first_location.table_id, last_location.table_id);
+    assert_eq!(first_location.table_row.index(), 0);
+    assert_eq!(last_location.table_row.index(), 2);
+
+    world.entity_mut(first).remove::<DenseB>();
+
+    let moved_last_location = world.entities().get_spawned(last).unwrap();
+    assert_eq!(moved_last_location.table_id, last_location.table_id);
+    assert_eq!(moved_last_location.table_row.index(), 0);
+    assert_eq!(
+        world.storages.tables[moved_last_location.table_id].entities()
+            [moved_last_location.table_row.index()],
+        last
+    );
+    assert_eq!(
+        world.get::<DenseA>(last).map(|component| component.0),
+        Some(2)
+    );
+    assert_eq!(
+        world.get::<DenseB>(last).map(|component| component.0),
+        Some(2)
+    );
+    assert_eq!(
+        world.get::<DenseA>(middle).map(|component| component.0),
+        Some(1)
+    );
+    world
+        .storages
+        .sparse_sets
+        .audit_assert_dense_sparse_mappings();
+}
+
+#[test]
+fn sparse_set_take_forgets_storage_but_transfers_drop_ownership() {
+    let drops = Arc::new(AtomicUsize::new(0));
+    let mut world = World::new();
+    let entity = world
+        .spawn(SparseDropAudit {
+            drops: drops.clone(),
+        })
+        .id();
+
+    let taken = world.entity_mut(entity).take::<SparseDropAudit>().unwrap();
+    assert!(world.get::<SparseDropAudit>(entity).is_none());
+    assert_eq!(drops.load(Ordering::SeqCst), 0);
+    world
+        .storages
+        .sparse_sets
+        .audit_assert_dense_sparse_mappings();
+
+    drop(taken);
+    assert_eq!(drops.load(Ordering::SeqCst), 1);
+
+    world.entity_mut(entity).insert(SparseDropAudit {
+        drops: drops.clone(),
+    });
+    assert!(world.despawn(entity));
+    assert_eq!(drops.load(Ordering::SeqCst), 2);
+    world
+        .storages
+        .sparse_sets
+        .audit_assert_dense_sparse_mappings();
 }
 
 #[test]

@@ -1632,6 +1632,25 @@ mod tests {
         world.spawn(A);
     }
 
+    #[test]
+    fn observer_reentrant_storage_mutation_updates_table_and_sparse_storage() {
+        let mut world = World::new();
+        world.add_observer(|add: On<Add, A>, mut commands: Commands| {
+            commands.entity(add.entity).insert((B, S));
+        });
+        world.add_observer(|add: On<Add, B>, mut commands: Commands| {
+            commands.entity(add.entity).remove::<A>();
+        });
+
+        let entity = world.spawn(A).flush();
+
+        assert!(world.get::<A>(entity).is_none());
+        assert!(world.get::<B>(entity).is_some());
+        assert!(world.get::<S>(entity).is_some());
+        assert_eq!(world.query::<&B>().query(&world).count(), 1);
+        assert_eq!(world.query::<&S>().query(&world).count(), 1);
+    }
+
     // Regression test for https://github.com/bevyengine/bevy/issues/14467
     // Fails prior to https://github.com/bevyengine/bevy/pull/15398
     #[test]

@@ -970,14 +970,21 @@ impl MainThreadExecutor {
 #[cfg(test)]
 mod tests {
     use crate::{
-        prelude::Resource,
+        prelude::{Res, ResMut, Resource},
         schedule::{IntoScheduleConfigs, MultiThreadedExecutor, Schedule},
         system::Commands,
         world::World,
     };
+    use core::sync::atomic::{AtomicUsize, Ordering};
 
     #[derive(Resource)]
     struct R;
+
+    #[derive(Resource, Default)]
+    struct ConditionRaceCounter {
+        value: usize,
+        condition_calls: AtomicUsize,
+    }
 
     #[test]
     fn skipped_systems_notify_dependents() {
@@ -996,6 +1003,38 @@ mod tests {
         );
         schedule.run(&mut world);
         assert!(world.get_resource::<R>().is_some());
+    }
+
+    #[test]
+    fn run_condition_access_conflicting_with_running_systems_is_serialized() {
+        fn slow_system(mut counter: ResMut<ConditionRaceCounter>) {
+            for i in 0..1024 {
+                core::hint::black_box(i);
+            }
+            counter.as_mut().value += 1;
+        }
+
+        fn condition(counter: Res<ConditionRaceCounter>) -> bool {
+            counter.condition_calls.fetch_add(1, Ordering::SeqCst);
+            core::hint::black_box(counter.value);
+            true
+        }
+
+        fn gated_system(mut counter: ResMut<ConditionRaceCounter>) {
+            counter.as_mut().value += 100;
+        }
+
+        let mut world = World::new();
+        world.init_resource::<ConditionRaceCounter>();
+        let mut schedule = Schedule::default();
+        schedule.set_executor(MultiThreadedExecutor::new());
+        schedule.add_systems((slow_system, gated_system.run_if(condition)));
+
+        schedule.run(&mut world);
+
+        let counter = world.resource::<ConditionRaceCounter>();
+        assert_eq!(counter.value, 101);
+        assert_eq!(counter.condition_calls.load(Ordering::SeqCst), 1);
     }
 
     /// Regression test for a weird bug flagged by MIRI in
