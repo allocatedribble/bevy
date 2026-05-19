@@ -553,6 +553,10 @@ impl Table {
     /// Call [`Tick::check_tick`] on all of the ticks in the [`Table`]
     pub(crate) fn check_change_ticks(&mut self, check: CheckChangeTicks) {
         let len = self.entity_count() as usize;
+        crate::audit::change_tick_table_scanned(len, self.component_count());
+        if len == 0 {
+            return;
+        }
         for col in self.columns.values_mut() {
             // SAFETY: `len` is the actual length of the column
             unsafe { col.check_change_ticks(len, check) };

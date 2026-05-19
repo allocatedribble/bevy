@@ -3238,8 +3238,12 @@ impl World {
     pub fn check_change_ticks(&mut self) -> Option<CheckChangeTicks> {
         let change_tick = self.change_tick();
         if change_tick.relative_to(self.last_check_tick).get() < CHECK_TICK_THRESHOLD {
+            crate::audit::change_tick_check_skipped_under_threshold();
             return None;
         }
+
+        #[cfg(all(feature = "bevy_ecs_audit", feature = "std"))]
+        let audit_start = std::time::Instant::now();
 
         let check = CheckChangeTicks(change_tick);
 
@@ -3265,7 +3269,19 @@ impl World {
 
         self.last_check_tick = change_tick;
 
+        #[cfg(all(feature = "bevy_ecs_audit", feature = "std"))]
+        crate::audit::change_tick_check_finished(audit_start.elapsed().as_nanos() as usize);
+        #[cfg(all(feature = "bevy_ecs_audit", not(feature = "std")))]
+        crate::audit::change_tick_check_finished(0);
+
         Some(check)
+    }
+
+    #[cfg(feature = "bevy_ecs_audit")]
+    pub(crate) fn audit_force_check_change_ticks(&mut self) -> Option<CheckChangeTicks> {
+        let change_tick = self.change_tick();
+        self.last_check_tick = Tick::new(change_tick.get().wrapping_sub(CHECK_TICK_THRESHOLD));
+        self.check_change_ticks()
     }
 
     /// Clears all entities, resources, and non-send data.

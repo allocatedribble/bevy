@@ -1671,6 +1671,7 @@ mod tests {
     use bevy_ecs_macros::ScheduleLabel;
 
     use crate::{
+        change_detection::{CheckChangeTicks, Tick, MAX_CHANGE_AGE},
         error::{ignore, panic, FallbackErrorHandler, Result},
         prelude::{ApplyDeferred, IntoSystemSet, Res, Resource},
         schedule::{
@@ -1678,7 +1679,7 @@ mod tests {
             IntoScheduleConfigs, Schedule, ScheduleBuildPass, ScheduleBuildSettings,
             ScheduleCleanupPolicy, SystemSet,
         },
-        system::Commands,
+        system::{Commands, System},
         world::World,
     };
 
@@ -1689,6 +1690,68 @@ mod tests {
 
     #[derive(Resource)]
     struct Resource2;
+
+    #[derive(ScheduleLabel, Hash, Debug, Clone, PartialEq, Eq)]
+    struct TickAuditSchedule;
+
+    fn tick_audit_system() {}
+
+    fn stale_check_tick_from(last_run: Tick, age: u32) -> CheckChangeTicks {
+        CheckChangeTicks(Tick::new(last_run.get().wrapping_add(age)))
+    }
+
+    fn expected_clamped_tick(check: CheckChangeTicks) -> Tick {
+        Tick::new(check.present_tick().get().wrapping_sub(MAX_CHANGE_AGE))
+    }
+
+    fn initialized_tick_audit_schedule(world: &mut World) -> Schedule {
+        let mut schedule = Schedule::new(TickAuditSchedule);
+        schedule.add_systems(tick_audit_system);
+        assert!(schedule.initialize(world).is_ok());
+        schedule
+    }
+
+    #[test]
+    fn schedule_check_change_ticks_clamps_rare_system_last_run() {
+        let mut world = World::new();
+        let mut schedule = initialized_tick_audit_schedule(&mut world);
+        let last_run = schedule.executable.systems[0].get_last_run();
+        let check = stale_check_tick_from(last_run, MAX_CHANGE_AGE + 1);
+
+        schedule.check_change_ticks(check);
+
+        assert_eq!(
+            schedule.executable.systems[0].get_last_run(),
+            expected_clamped_tick(check)
+        );
+    }
+
+    #[test]
+    fn schedules_resource_checks_reinserted_schedule_ticks() {
+        let mut world = World::new();
+        let mut schedules = Schedules::new();
+        let mut schedule = initialized_tick_audit_schedule(&mut world);
+        schedule.executable.systems[0].set_last_run(Tick::new(11));
+        schedules.insert(schedule);
+
+        let first_check = stale_check_tick_from(Tick::new(11), MAX_CHANGE_AGE + 3);
+        schedules.check_change_ticks(first_check);
+        assert_eq!(
+            schedules.get(TickAuditSchedule).unwrap().executable.systems[0].get_last_run(),
+            expected_clamped_tick(first_check)
+        );
+
+        let mut removed = schedules.remove(TickAuditSchedule).unwrap();
+        removed.executable.systems[0].set_last_run(Tick::new(29));
+        schedules.reinsert(removed);
+
+        let second_check = stale_check_tick_from(Tick::new(29), MAX_CHANGE_AGE + 5);
+        schedules.check_change_ticks(second_check);
+        assert_eq!(
+            schedules.get(TickAuditSchedule).unwrap().executable.systems[0].get_last_run(),
+            expected_clamped_tick(second_check)
+        );
+    }
 
     #[test]
     fn unchanged_auto_insert_apply_deferred_has_no_effect() {

@@ -484,8 +484,13 @@ impl ComponentSparseSet {
     }
 
     pub(crate) fn check_change_ticks(&mut self, check: CheckChangeTicks) {
+        let len = self.len();
+        crate::audit::change_tick_sparse_set_scanned(len);
+        if len == 0 {
+            return;
+        }
         // SAFETY: This is using the valid size of the column.
-        unsafe { self.dense.check_change_ticks(self.len(), check) };
+        unsafe { self.dense.check_change_ticks(len, check) };
     }
 
     #[cfg(any(test, feature = "bevy_ecs_audit"))]

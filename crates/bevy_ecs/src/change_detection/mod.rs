@@ -27,10 +27,14 @@ pub const MAX_CHANGE_AGE: u32 = u32::MAX - (2 * CHECK_TICK_THRESHOLD - 1);
 
 #[cfg(test)]
 mod tests {
+    use alloc::vec::Vec;
     use bevy_ecs_macros::Resource;
     use bevy_ptr::PtrMut;
     use bevy_reflect::{FromType, ReflectFromPtr};
-    use core::ops::{Deref, DerefMut};
+    use core::{
+        ops::{Deref, DerefMut},
+        sync::atomic::{AtomicU32, Ordering},
+    };
 
     use crate::{
         change_detection::{
@@ -38,6 +42,7 @@ mod tests {
             CHECK_TICK_THRESHOLD, MAX_CHANGE_AGE,
         },
         component::Component,
+        query::{Added, Changed, QueryFilter},
         system::{IntoSystem, Single, System},
         world::World,
     };
@@ -52,6 +57,20 @@ mod tests {
 
     #[derive(Resource, PartialEq)]
     struct R2(u8);
+
+    #[derive(Component)]
+    struct TableTracked(u32);
+
+    #[derive(Component)]
+    #[component(storage = "SparseSet")]
+    #[expect(
+        dead_code,
+        reason = "change-detection regression payload stays non-ZST"
+    )]
+    struct SparseTracked(u32);
+
+    #[derive(Resource)]
+    struct InteriorResource(AtomicU32);
 
     impl Deref for R2 {
         type Target = u8;
@@ -146,6 +165,159 @@ mod tests {
             assert_eq!(ticks_since_insert, MAX_CHANGE_AGE);
             assert_eq!(ticks_since_change, MAX_CHANGE_AGE);
         }
+    }
+
+    fn count_filtered<F: QueryFilter>(world: &mut World) -> usize {
+        world.query_filtered::<(), F>().iter(world).count()
+    }
+
+    fn tick_behind(tick: Tick, age: u32) -> Tick {
+        Tick::new(tick.get().wrapping_sub(age))
+    }
+
+    fn expected_change_visible(event_tick: Tick, last_run: Tick, this_run: Tick) -> bool {
+        let event_age = this_run
+            .get()
+            .wrapping_sub(event_tick.get())
+            .min(MAX_CHANGE_AGE);
+        let system_age = this_run
+            .get()
+            .wrapping_sub(last_run.get())
+            .min(MAX_CHANGE_AGE);
+        system_age > event_age
+    }
+
+    #[test]
+    fn randomized_tick_window_oracle_matches_table_and_sparse_filters() {
+        let mut seed = 0x5eed_c0de_u32;
+        let mut interesting_ages = Vec::from([
+            0,
+            1,
+            CHECK_TICK_THRESHOLD - 1,
+            CHECK_TICK_THRESHOLD,
+            MAX_CHANGE_AGE - 1,
+            MAX_CHANGE_AGE,
+            MAX_CHANGE_AGE.wrapping_add(1),
+            u32::MAX - 1,
+            u32::MAX,
+        ]);
+
+        for _ in 0..64 {
+            seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            interesting_ages.push(seed);
+        }
+
+        for (index, event_age) in interesting_ages.iter().copied().enumerate() {
+            for system_age in interesting_ages.iter().copied().skip(index % 7).step_by(7) {
+                seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                let this_run = Tick::new(seed);
+                let event_tick = tick_behind(this_run, event_age);
+                let last_run = tick_behind(this_run, system_age);
+                let expected = expected_change_visible(event_tick, last_run, this_run);
+
+                let mut world = World::new();
+                *world.change_tick.get_mut() = event_tick.get();
+                world.spawn((TableTracked(index as u32), SparseTracked(system_age)));
+                *world.change_tick.get_mut() = this_run.get();
+
+                world.last_change_tick_scope(last_run, |world| {
+                    assert_eq!(
+                        count_filtered::<Added<TableTracked>>(world) == 1,
+                        expected,
+                        "table Added mismatch for event_age={event_age} system_age={system_age}"
+                    );
+                    assert_eq!(
+                        count_filtered::<Changed<TableTracked>>(world) == 1,
+                        expected,
+                        "table Changed mismatch for event_age={event_age} system_age={system_age}"
+                    );
+                    assert_eq!(
+                        count_filtered::<Added<SparseTracked>>(world) == 1,
+                        expected,
+                        "sparse Added mismatch for event_age={event_age} system_age={system_age}"
+                    );
+                    assert_eq!(
+                        count_filtered::<Changed<SparseTracked>>(world) == 1,
+                        expected,
+                        "sparse Changed mismatch for event_age={event_age} system_age={system_age}"
+                    );
+                });
+            }
+        }
+    }
+
+    #[test]
+    fn add_change_remove_resource_and_sparse_sequences_update_filters() {
+        let mut world = World::new();
+        world.insert_resource(R2(0));
+        let entity = world.spawn((TableTracked(0), SparseTracked(0))).id();
+
+        assert_eq!(count_filtered::<Added<TableTracked>>(&mut world), 1);
+        assert_eq!(count_filtered::<Changed<TableTracked>>(&mut world), 1);
+        assert_eq!(count_filtered::<Added<SparseTracked>>(&mut world), 1);
+        assert_eq!(count_filtered::<Changed<SparseTracked>>(&mut world), 1);
+        assert!(world.is_resource_changed::<R2>());
+
+        world.clear_trackers();
+        assert_eq!(count_filtered::<Added<TableTracked>>(&mut world), 0);
+        assert_eq!(count_filtered::<Changed<TableTracked>>(&mut world), 0);
+        assert_eq!(count_filtered::<Added<SparseTracked>>(&mut world), 0);
+        assert_eq!(count_filtered::<Changed<SparseTracked>>(&mut world), 0);
+        assert!(!world.is_resource_changed::<R2>());
+
+        world
+            .entity_mut(entity)
+            .get_mut::<TableTracked>()
+            .unwrap()
+            .0 = 1;
+        world.entity_mut(entity).remove::<SparseTracked>();
+        world.resource_mut::<R2>().set_if_neq(R2(1));
+
+        assert_eq!(count_filtered::<Added<TableTracked>>(&mut world), 0);
+        assert_eq!(count_filtered::<Changed<TableTracked>>(&mut world), 1);
+        assert_eq!(count_filtered::<Added<SparseTracked>>(&mut world), 0);
+        assert_eq!(count_filtered::<Changed<SparseTracked>>(&mut world), 0);
+        assert!(world.is_resource_changed::<R2>());
+
+        world.clear_trackers();
+        world.entity_mut(entity).insert(SparseTracked(1));
+
+        assert_eq!(count_filtered::<Added<TableTracked>>(&mut world), 0);
+        assert_eq!(count_filtered::<Changed<TableTracked>>(&mut world), 0);
+        assert_eq!(count_filtered::<Added<SparseTracked>>(&mut world), 1);
+        assert_eq!(count_filtered::<Changed<SparseTracked>>(&mut world), 1);
+        assert!(!world.is_resource_changed::<R2>());
+    }
+
+    #[test]
+    fn interior_mutability_requires_manual_set_changed() {
+        let mut world = World::new();
+        world.insert_resource(InteriorResource(AtomicU32::new(0)));
+        world.clear_trackers();
+
+        world
+            .resource::<InteriorResource>()
+            .0
+            .store(1, Ordering::Relaxed);
+        assert!(!world.is_resource_changed::<InteriorResource>());
+
+        world.resource_mut::<InteriorResource>().set_changed();
+        assert!(world.is_resource_changed::<InteriorResource>());
+    }
+
+    #[test]
+    fn last_change_tick_scope_controls_resource_detection_and_restores_tick() {
+        let mut world = World::new();
+        world.insert_resource(R2(0));
+        world.clear_trackers();
+        let saved_last_change_tick = world.last_change_tick();
+
+        world.resource_mut::<R2>().set_if_neq(R2(1));
+        assert!(world.is_resource_changed::<R2>());
+
+        let this_run = world.change_tick();
+        assert!(!world.last_change_tick_scope(this_run, |world| world.is_resource_changed::<R2>()));
+        assert_eq!(world.last_change_tick(), saved_last_change_tick);
     }
 
     #[test]

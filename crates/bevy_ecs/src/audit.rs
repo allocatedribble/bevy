@@ -60,6 +60,14 @@ mod imp {
         RELATIONSHIP_ADDS,
         RELATIONSHIP_REMOVES,
         RELATIONSHIP_COLLECTION_SCAN_LEN,
+        CHANGE_TICK_CHECKS,
+        CHANGE_TICK_CHECK_SKIPPED_UNDER_THRESHOLD,
+        CHANGE_TICK_CHECK_NANOS,
+        CHANGE_TICK_CHECK_TABLES,
+        CHANGE_TICK_CHECK_EMPTY_TABLES,
+        CHANGE_TICK_CHECK_SPARSE_SETS,
+        CHANGE_TICK_CHECK_EMPTY_SPARSE_SETS,
+        CHANGE_TICK_CHECK_COMPONENT_TICKS,
     );
 
     #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -105,6 +113,14 @@ mod imp {
         pub relationship_adds: usize,
         pub relationship_removes: usize,
         pub relationship_collection_scan_len: usize,
+        pub change_tick_checks: usize,
+        pub change_tick_check_skipped_under_threshold: usize,
+        pub change_tick_check_nanos: usize,
+        pub change_tick_check_tables: usize,
+        pub change_tick_check_empty_tables: usize,
+        pub change_tick_check_sparse_sets: usize,
+        pub change_tick_check_empty_sparse_sets: usize,
+        pub change_tick_check_component_ticks: usize,
     }
 
     #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -323,6 +339,45 @@ mod imp {
         add(&RELATIONSHIP_COLLECTION_SCAN_LEN, collection_scan_len);
     }
 
+    #[inline]
+    pub(crate) fn change_tick_check_skipped_under_threshold() {
+        inc(&CHANGE_TICK_CHECK_SKIPPED_UNDER_THRESHOLD);
+    }
+
+    #[inline]
+    pub(crate) fn change_tick_check_finished(nanos: usize) {
+        inc(&CHANGE_TICK_CHECKS);
+        add(&CHANGE_TICK_CHECK_NANOS, nanos);
+    }
+
+    #[inline]
+    pub(crate) fn change_tick_table_scanned(entity_count: usize, component_count: usize) {
+        inc(&CHANGE_TICK_CHECK_TABLES);
+        if entity_count == 0 {
+            inc(&CHANGE_TICK_CHECK_EMPTY_TABLES);
+        } else {
+            add(
+                &CHANGE_TICK_CHECK_COMPONENT_TICKS,
+                entity_count
+                    .saturating_mul(component_count)
+                    .saturating_mul(2),
+            );
+        }
+    }
+
+    #[inline]
+    pub(crate) fn change_tick_sparse_set_scanned(entity_count: usize) {
+        inc(&CHANGE_TICK_CHECK_SPARSE_SETS);
+        if entity_count == 0 {
+            inc(&CHANGE_TICK_CHECK_EMPTY_SPARSE_SETS);
+        } else {
+            add(
+                &CHANGE_TICK_CHECK_COMPONENT_TICKS,
+                entity_count.saturating_mul(2),
+            );
+        }
+    }
+
     pub fn reset() {
         reset_all();
         OBSERVER_TRIGGER_DEPTH.store(0, Ordering::Relaxed);
@@ -371,6 +426,16 @@ mod imp {
             relationship_adds: load(&RELATIONSHIP_ADDS),
             relationship_removes: load(&RELATIONSHIP_REMOVES),
             relationship_collection_scan_len: load(&RELATIONSHIP_COLLECTION_SCAN_LEN),
+            change_tick_checks: load(&CHANGE_TICK_CHECKS),
+            change_tick_check_skipped_under_threshold: load(
+                &CHANGE_TICK_CHECK_SKIPPED_UNDER_THRESHOLD,
+            ),
+            change_tick_check_nanos: load(&CHANGE_TICK_CHECK_NANOS),
+            change_tick_check_tables: load(&CHANGE_TICK_CHECK_TABLES),
+            change_tick_check_empty_tables: load(&CHANGE_TICK_CHECK_EMPTY_TABLES),
+            change_tick_check_sparse_sets: load(&CHANGE_TICK_CHECK_SPARSE_SETS),
+            change_tick_check_empty_sparse_sets: load(&CHANGE_TICK_CHECK_EMPTY_SPARSE_SETS),
+            change_tick_check_component_ticks: load(&CHANGE_TICK_CHECK_COMPONENT_TICKS),
         }
     }
 
@@ -391,6 +456,12 @@ mod imp {
             sparse_set_entity_capacity: storages.sparse_sets.audit_entity_capacity(),
             sparse_set_sparse_slots: storages.sparse_sets.audit_sparse_slot_count(),
         }
+    }
+
+    pub fn force_check_change_ticks(
+        world: &mut crate::world::World,
+    ) -> Option<crate::change_detection::CheckChangeTicks> {
+        world.audit_force_check_change_ticks()
     }
 }
 
@@ -468,12 +539,26 @@ mod imp {
     pub(crate) fn relationship_add(_: usize) {}
     #[inline]
     pub(crate) fn relationship_remove(_: usize) {}
+    #[inline]
+    pub(crate) fn change_tick_check_skipped_under_threshold() {}
+    #[inline]
+    #[expect(
+        dead_code,
+        reason = "audit-only timing hooks are compiled out when bevy_ecs_audit is disabled"
+    )]
+    pub(crate) fn change_tick_check_finished(_: usize) {}
+    #[inline]
+    pub(crate) fn change_tick_table_scanned(_: usize, _: usize) {}
+    #[inline]
+    pub(crate) fn change_tick_sparse_set_scanned(_: usize) {}
 }
 
 pub(crate) use imp::*;
 
 #[cfg(feature = "bevy_ecs_audit")]
-pub use imp::{reset, snapshot, storage_metrics, AuditCounters, StorageMetrics};
+pub use imp::{
+    force_check_change_ticks, reset, snapshot, storage_metrics, AuditCounters, StorageMetrics,
+};
 
 #[cfg(all(test, feature = "bevy_ecs_audit"))]
 mod tests {
@@ -493,6 +578,9 @@ mod tests {
     #[derive(Component)]
     #[component(storage = "SparseSet")]
     struct SparseComponent;
+
+    #[derive(Component)]
+    struct EmptyTableComponent;
 
     #[derive(Event)]
     struct AuditEvent;
@@ -518,6 +606,9 @@ mod tests {
         let entity = world.spawn((TableComponent, SparseComponent)).id();
         let mut query = world.query::<(&TableComponent, Option<&SparseComponent>)>();
         assert_eq!(query.iter(&world).count(), 1);
+
+        let empty_table_entity = world.spawn(EmptyTableComponent).id();
+        world.despawn(empty_table_entity);
 
         world.entity_mut(entity).remove::<SparseComponent>();
 
@@ -546,6 +637,9 @@ mod tests {
             .add_systems((audit_schedule_command, ApplyDeferred, audit_schedule_system).chain());
         schedule.run(&mut world);
 
+        assert!(world.check_change_ticks().is_none());
+        assert!(super::force_check_change_ticks(&mut world).is_some());
+
         let counters = super::snapshot();
         assert!(counters.query_update_archetypes > 0);
         assert!(counters.query_new_archetype_calls > 0);
@@ -567,5 +661,12 @@ mod tests {
         assert!(counters.apply_deferred_calls > 0);
         assert!(counters.observer_dispatches >= 1);
         assert!(counters.observer_max_trigger_depth > 0);
+        assert!(counters.change_tick_check_skipped_under_threshold > 0);
+        assert!(counters.change_tick_checks > 0);
+        assert!(counters.change_tick_check_tables > 0);
+        assert!(counters.change_tick_check_empty_tables > 0);
+        assert!(counters.change_tick_check_sparse_sets > 0);
+        assert!(counters.change_tick_check_empty_sparse_sets > 0);
+        assert!(counters.change_tick_check_component_ticks > 0);
     }
 }

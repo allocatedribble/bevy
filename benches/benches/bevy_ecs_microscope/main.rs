@@ -51,6 +51,22 @@ struct TableOnly(u32);
 #[component(storage = "SparseSet")]
 struct Sparse(u32);
 
+macro_rules! sparse_components {
+    ($($name:ident),* $(,)?) => {
+        $(
+            #[derive(Component)]
+            #[component(storage = "SparseSet")]
+            #[expect(dead_code, reason = "benchmark payload keeps sparse tick columns non-ZST")]
+            struct $name(u32);
+        )*
+    };
+}
+
+sparse_components!(
+    Sparse0, Sparse1, Sparse2, Sparse3, Sparse4, Sparse5, Sparse6, Sparse7, Sparse8, Sparse9,
+    Sparse10, Sparse11, Sparse12, Sparse13, Sparse14, Sparse15,
+);
+
 #[derive(Event)]
 struct MicroscopeEvent;
 
@@ -219,6 +235,74 @@ fn add_archetype_bits(world: &mut World, count: usize) {
             entity.insert(A15);
         }
     }
+}
+
+fn spawn_sparse_set_scan_entities(world: &mut World, count: usize) {
+    for i in 0..count {
+        let value = i as u32;
+        let mut entity = world.spawn_empty();
+        match i & 15 {
+            0 => {
+                entity.insert(Sparse0(value));
+            }
+            1 => {
+                entity.insert(Sparse1(value));
+            }
+            2 => {
+                entity.insert(Sparse2(value));
+            }
+            3 => {
+                entity.insert(Sparse3(value));
+            }
+            4 => {
+                entity.insert(Sparse4(value));
+            }
+            5 => {
+                entity.insert(Sparse5(value));
+            }
+            6 => {
+                entity.insert(Sparse6(value));
+            }
+            7 => {
+                entity.insert(Sparse7(value));
+            }
+            8 => {
+                entity.insert(Sparse8(value));
+            }
+            9 => {
+                entity.insert(Sparse9(value));
+            }
+            10 => {
+                entity.insert(Sparse10(value));
+            }
+            11 => {
+                entity.insert(Sparse11(value));
+            }
+            12 => {
+                entity.insert(Sparse12(value));
+            }
+            13 => {
+                entity.insert(Sparse13(value));
+            }
+            14 => {
+                entity.insert(Sparse14(value));
+            }
+            15 => {
+                entity.insert(Sparse15(value));
+            }
+            _ => unreachable!(),
+        };
+    }
+}
+
+#[cfg(feature = "ecs_audit")]
+fn force_change_tick_scan(world: &mut World) {
+    black_box(bevy_ecs::audit::force_check_change_ticks(world));
+}
+
+#[cfg(not(feature = "ecs_audit"))]
+fn force_change_tick_scan(world: &mut World) {
+    black_box(world.check_change_ticks());
 }
 
 fn spawn_wide(world: &mut World, width: usize, value: u64) -> Entity {
@@ -1062,6 +1146,116 @@ fn scheduler_apply_deferred_frequency(c: &mut Criterion) {
     group.finish();
 }
 
+fn change_detection_scan(c: &mut Criterion) {
+    let mut group = c.benchmark_group("ecs_microscope/change_detection_scan");
+    group.warm_up_time(core::time::Duration::from_millis(250));
+    group.measurement_time(core::time::Duration::from_secs(2));
+    group.sample_size(10);
+
+    group.bench_function("check_ticks_1m_table_components", |bencher| {
+        let mut world = World::new();
+        world.spawn_batch((0..1_000_000).map(|i| TableOnly(i as u32)));
+        bencher.iter(|| force_change_tick_scan(&mut world));
+    });
+
+    for archetype_count in [1_000, 10_000] {
+        group.bench_with_input(
+            BenchmarkId::new("check_ticks_many_tables", archetype_count),
+            &archetype_count,
+            |bencher, &archetype_count| {
+                let mut world = World::new();
+                add_archetype_bits(&mut world, archetype_count);
+                bencher.iter(|| force_change_tick_scan(&mut world));
+            },
+        );
+    }
+
+    for entity_count in [10_000, 100_000] {
+        group.bench_with_input(
+            BenchmarkId::new("check_ticks_many_sparse_sets", entity_count),
+            &entity_count,
+            |bencher, &entity_count| {
+                let mut world = World::new();
+                spawn_sparse_set_scan_entities(&mut world, entity_count);
+                bencher.iter(|| force_change_tick_scan(&mut world));
+            },
+        );
+    }
+
+    group.finish();
+}
+
+fn change_detection_filters(c: &mut Criterion) {
+    let mut group = c.benchmark_group("ecs_microscope/change_detection_filters");
+    group.warm_up_time(core::time::Duration::from_millis(250));
+    group.measurement_time(core::time::Duration::from_secs(2));
+    group.sample_size(20);
+
+    for entity_count in [10_000, 100_000] {
+        group.bench_with_input(
+            BenchmarkId::new("changed_table_almost_nothing", entity_count),
+            &entity_count,
+            |bencher, &entity_count| {
+                let mut world = World::new();
+                let entities = world
+                    .spawn_batch((0..entity_count).map(|i| TableOnly(i as u32)))
+                    .collect::<Vec<_>>();
+                world.clear_trackers();
+                for entity in entities.iter().take(entity_count / 100) {
+                    if let Some(mut item) = world.entity_mut(*entity).get_mut::<TableOnly>() {
+                        item.0 = item.0.wrapping_add(1);
+                    }
+                }
+                let mut query = world.query_filtered::<&TableOnly, Changed<TableOnly>>();
+                bencher.iter(|| black_box(query.iter(&world).count()));
+            },
+        );
+
+        group.bench_with_input(
+            BenchmarkId::new("changed_table_everything", entity_count),
+            &entity_count,
+            |bencher, &entity_count| {
+                let mut world = World::new();
+                world.spawn_batch((0..entity_count).map(|i| TableOnly(i as u32)));
+                let mut query = world.query_filtered::<&TableOnly, Changed<TableOnly>>();
+                bencher.iter(|| black_box(query.iter(&world).count()));
+            },
+        );
+
+        group.bench_with_input(
+            BenchmarkId::new("changed_sparse_almost_nothing", entity_count),
+            &entity_count,
+            |bencher, &entity_count| {
+                let mut world = World::new();
+                let entities = world
+                    .spawn_batch((0..entity_count).map(|i| Sparse(i as u32)))
+                    .collect::<Vec<_>>();
+                world.clear_trackers();
+                for entity in entities.iter().take(entity_count / 100) {
+                    if let Some(mut item) = world.entity_mut(*entity).get_mut::<Sparse>() {
+                        item.0 = item.0.wrapping_add(1);
+                    }
+                }
+                let mut query = world.query_filtered::<&Sparse, Changed<Sparse>>();
+                bencher.iter(|| black_box(query.iter(&world).count()));
+            },
+        );
+
+        group.bench_with_input(
+            BenchmarkId::new("changed_sparse_everything", entity_count),
+            &entity_count,
+            |bencher, &entity_count| {
+                let mut world = World::new();
+                world.spawn_batch((0..entity_count).map(|i| Sparse(i as u32)));
+                let mut query = world.query_filtered::<&Sparse, Changed<Sparse>>();
+                bencher.iter(|| black_box(query.iter(&world).count()));
+            },
+        );
+    }
+
+    group.finish();
+}
+
 fn observer_and_relationship_storms(c: &mut Criterion) {
     let mut group = c.benchmark_group("ecs_microscope/observer_relationship");
     group.warm_up_time(core::time::Duration::from_millis(250));
@@ -1127,6 +1321,8 @@ criterion_group!(
     scheduler_pressure,
     scheduler_build_pressure,
     scheduler_apply_deferred_frequency,
+    change_detection_scan,
+    change_detection_filters,
     observer_and_relationship_storms,
 );
 criterion_main!(benches);
