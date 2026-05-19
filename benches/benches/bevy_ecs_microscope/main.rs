@@ -1,7 +1,10 @@
 use bevy_ecs::{
     hierarchy::ChildOf,
     prelude::*,
-    schedule::{ApplyDeferred, MultiThreadedExecutor, Schedule, SingleThreadedExecutor},
+    schedule::{
+        ApplyDeferred, MultiThreadedExecutor, Schedule, ScheduleBuildSettings,
+        SingleThreadedExecutor,
+    },
     system::{Command, Commands, ParallelCommands},
     world::{CommandQueue, World},
 };
@@ -131,8 +134,29 @@ impl Command for LargeCommand {
 
 fn tiny_system() {}
 
+#[derive(Resource, Default)]
+struct SchedulerBenchCounter(u64);
+
+fn counter_system(mut counter: ResMut<SchedulerBenchCounter>) {
+    counter.0 = counter.0.wrapping_add(1);
+}
+
+fn medium_table_system(mut query: Query<&mut TableOnly>) {
+    for mut item in &mut query {
+        item.0 = item.0.wrapping_add(1);
+    }
+}
+
+fn always_true_condition() -> bool {
+    true
+}
+
 fn queue_spawn_command(mut commands: Commands) {
     commands.spawn(TableOnly(1));
+}
+
+fn queue_fake_command(mut commands: Commands) {
+    commands.queue(FakeCommand(1));
 }
 
 fn parallel_command_system(query: Query<Entity, With<TableOnly>>, par_commands: ParallelCommands) {
@@ -793,13 +817,80 @@ fn sparse_high_index(c: &mut Criterion) {
     group.finish();
 }
 
+fn add_tiny_systems(schedule: &mut Schedule, system_count: usize) {
+    for _ in 0..system_count {
+        schedule.add_systems(tiny_system);
+    }
+}
+
+fn add_counter_systems(schedule: &mut Schedule, system_count: usize) {
+    for _ in 0..system_count {
+        schedule.add_systems(counter_system);
+    }
+}
+
+fn add_conditioned_counter_systems(schedule: &mut Schedule, system_count: usize) {
+    for _ in 0..system_count {
+        schedule.add_systems(counter_system.run_if(always_true_condition));
+    }
+}
+
+fn add_every_ten_deferred_block(schedule: &mut Schedule) {
+    schedule.add_systems(
+        (
+            queue_fake_command,
+            queue_fake_command,
+            queue_fake_command,
+            queue_fake_command,
+            queue_fake_command,
+            queue_fake_command,
+            queue_fake_command,
+            queue_fake_command,
+            queue_fake_command,
+            queue_fake_command,
+            ApplyDeferred,
+        )
+            .chain(),
+    );
+}
+
+fn add_apply_deferred_frequency_systems(
+    schedule: &mut Schedule,
+    system_count: usize,
+    every: usize,
+) {
+    schedule.set_build_settings(ScheduleBuildSettings {
+        auto_insert_apply_deferred: false,
+        ..Default::default()
+    });
+
+    match every {
+        0 => {
+            for _ in 0..system_count {
+                schedule.add_systems(queue_fake_command);
+            }
+        }
+        1 => {
+            for _ in 0..system_count {
+                schedule.add_systems((queue_fake_command, ApplyDeferred).chain());
+            }
+        }
+        10 => {
+            for _ in 0..(system_count / 10) {
+                add_every_ten_deferred_block(schedule);
+            }
+        }
+        _ => unreachable!("unsupported ApplyDeferred frequency"),
+    }
+}
+
 fn scheduler_pressure(c: &mut Criterion) {
     let mut group = c.benchmark_group("ecs_microscope/scheduler_pressure");
     group.warm_up_time(core::time::Duration::from_millis(250));
     group.measurement_time(core::time::Duration::from_secs(2));
-    group.sample_size(30);
+    group.sample_size(20);
 
-    for system_count in [10, 100, 1_000] {
+    for system_count in [10, 100, 1_000, 10_000] {
         group.bench_with_input(
             BenchmarkId::new("single_threaded", system_count),
             &system_count,
@@ -807,9 +898,7 @@ fn scheduler_pressure(c: &mut Criterion) {
                 let mut world = World::new();
                 let mut schedule = Schedule::default();
                 schedule.set_executor(SingleThreadedExecutor::new());
-                for _ in 0..system_count {
-                    schedule.add_systems(tiny_system);
-                }
+                add_tiny_systems(&mut schedule, system_count);
                 schedule.run(&mut world);
                 bencher.iter(|| schedule.run(&mut world));
             },
@@ -822,13 +911,152 @@ fn scheduler_pressure(c: &mut Criterion) {
                 let mut world = World::new();
                 let mut schedule = Schedule::default();
                 schedule.set_executor(MultiThreadedExecutor::new());
+                add_tiny_systems(&mut schedule, system_count);
+                schedule.run(&mut world);
+                bencher.iter(|| schedule.run(&mut world));
+            },
+        );
+    }
+
+    for system_count in [10, 100, 1_000] {
+        group.bench_with_input(
+            BenchmarkId::new("multi_threaded_medium_query", system_count),
+            &system_count,
+            |bencher, &system_count| {
+                let mut world = World::new();
+                world.spawn_batch((0..1_000).map(|i| TableOnly(i as u32)));
+                let mut schedule = Schedule::default();
+                schedule.set_executor(MultiThreadedExecutor::new());
                 for _ in 0..system_count {
-                    schedule.add_systems(tiny_system);
+                    schedule.add_systems(medium_table_system);
                 }
                 schedule.run(&mut world);
                 bencher.iter(|| schedule.run(&mut world));
             },
         );
+    }
+
+    group.finish();
+}
+
+fn scheduler_build_pressure(c: &mut Criterion) {
+    let mut group = c.benchmark_group("ecs_microscope/scheduler_build_pressure");
+    group.warm_up_time(core::time::Duration::from_millis(250));
+    group.measurement_time(core::time::Duration::from_secs(2));
+    group.sample_size(10);
+
+    for system_count in [100, 1_000, 10_000] {
+        group.bench_with_input(
+            BenchmarkId::new("noop_single_threaded_build", system_count),
+            &system_count,
+            |bencher, &system_count| {
+                bencher.iter_batched(
+                    || {
+                        let mut schedule = Schedule::default();
+                        schedule.set_executor(SingleThreadedExecutor::new());
+                        add_tiny_systems(&mut schedule, system_count);
+                        (World::new(), schedule)
+                    },
+                    |(mut world, mut schedule)| {
+                        black_box(schedule.initialize(&mut world).unwrap());
+                    },
+                    BatchSize::LargeInput,
+                );
+            },
+        );
+
+        group.bench_with_input(
+            BenchmarkId::new("noop_multi_threaded_build", system_count),
+            &system_count,
+            |bencher, &system_count| {
+                bencher.iter_batched(
+                    || {
+                        let mut schedule = Schedule::default();
+                        schedule.set_executor(MultiThreadedExecutor::new());
+                        add_tiny_systems(&mut schedule, system_count);
+                        (World::new(), schedule)
+                    },
+                    |(mut world, mut schedule)| {
+                        black_box(schedule.initialize(&mut world).unwrap());
+                    },
+                    BatchSize::LargeInput,
+                );
+            },
+        );
+    }
+
+    for system_count in [100, 1_000] {
+        group.bench_with_input(
+            BenchmarkId::new("conflicting_resmut_build", system_count),
+            &system_count,
+            |bencher, &system_count| {
+                bencher.iter_batched(
+                    || {
+                        let mut world = World::new();
+                        world.init_resource::<SchedulerBenchCounter>();
+                        let mut schedule = Schedule::default();
+                        schedule.set_executor(MultiThreadedExecutor::new());
+                        add_counter_systems(&mut schedule, system_count);
+                        (world, schedule)
+                    },
+                    |(mut world, mut schedule)| {
+                        black_box(schedule.initialize(&mut world).unwrap());
+                    },
+                    BatchSize::LargeInput,
+                );
+            },
+        );
+
+        group.bench_with_input(
+            BenchmarkId::new("conditioned_resmut_build", system_count),
+            &system_count,
+            |bencher, &system_count| {
+                bencher.iter_batched(
+                    || {
+                        let mut world = World::new();
+                        world.init_resource::<SchedulerBenchCounter>();
+                        let mut schedule = Schedule::default();
+                        schedule.set_executor(MultiThreadedExecutor::new());
+                        add_conditioned_counter_systems(&mut schedule, system_count);
+                        (world, schedule)
+                    },
+                    |(mut world, mut schedule)| {
+                        black_box(schedule.initialize(&mut world).unwrap());
+                    },
+                    BatchSize::LargeInput,
+                );
+            },
+        );
+    }
+
+    group.finish();
+}
+
+fn scheduler_apply_deferred_frequency(c: &mut Criterion) {
+    let mut group = c.benchmark_group("ecs_microscope/scheduler_apply_deferred_frequency");
+    group.warm_up_time(core::time::Duration::from_millis(250));
+    group.measurement_time(core::time::Duration::from_secs(2));
+    group.sample_size(20);
+
+    for system_count in [100, 1_000] {
+        for (name, every) in [
+            ("final_only", 0usize),
+            ("every_10_systems", 10),
+            ("every_system", 1),
+        ] {
+            group.bench_with_input(
+                BenchmarkId::new(name, system_count),
+                &(system_count, every),
+                |bencher, &(system_count, every)| {
+                    let mut world = World::new();
+                    let mut schedule = Schedule::default();
+                    schedule.set_executor(MultiThreadedExecutor::new());
+                    add_apply_deferred_frequency_systems(&mut schedule, system_count, every);
+                    schedule.run(&mut world);
+                    bencher.iter(|| schedule.run(&mut world));
+                },
+            );
+        }
     }
 
     group.finish();
@@ -897,6 +1125,8 @@ criterion_group!(
     archetype_churn_and_empty_cache,
     sparse_high_index,
     scheduler_pressure,
+    scheduler_build_pressure,
+    scheduler_apply_deferred_frequency,
     observer_and_relationship_storms,
 );
 criterion_main!(benches);

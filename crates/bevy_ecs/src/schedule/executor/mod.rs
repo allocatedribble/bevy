@@ -315,12 +315,17 @@ mod __rust_begin_short_backtrace {
 
 #[cfg(test)]
 mod tests {
+    use alloc::{vec, vec::Vec};
+
     use crate::{
-        prelude::{Component, In, IntoSystem, Resource, Schedule},
-        schedule::{MultiThreadedExecutor, SingleThreadedExecutor},
-        system::{Populated, Res, ResMut, Single},
+        prelude::{Component, In, IntoSystem, Resource, Schedule, SystemSet},
+        schedule::{
+            ApplyDeferred, IntoScheduleConfigs, MultiThreadedExecutor, SingleThreadedExecutor,
+        },
+        system::{Commands, Populated, Res, ResMut, Single},
         world::World,
     };
+    use std::panic::{catch_unwind, AssertUnwindSafe};
 
     #[derive(Component)]
     struct TestComponent;
@@ -334,6 +339,21 @@ mod tests {
     #[derive(Resource, Default)]
     struct Counter(u8);
 
+    #[derive(Resource, Default, Clone, Debug, PartialEq, Eq)]
+    struct ExecutorAuditState {
+        bits: u32,
+        log: Vec<u8>,
+    }
+
+    #[derive(Resource, Default)]
+    struct ExecutorAuditGate {
+        system_allowed: bool,
+        set_allowed: bool,
+    }
+
+    #[derive(SystemSet, Debug, Hash, PartialEq, Eq, Clone, Copy)]
+    struct ExecutorAuditSet;
+
     fn set_single_state(mut _single: Single<&TestComponent>, mut state: ResMut<TestState>) {
         state.single_ran = true;
     }
@@ -343,6 +363,91 @@ mod tests {
         mut state: ResMut<TestState>,
     ) {
         state.populated_ran = true;
+    }
+
+    fn mark<const N: u8>(mut state: ResMut<ExecutorAuditState>) {
+        state.bits |= 1u32 << N;
+        state.log.push(N);
+    }
+
+    fn require<const BEFORE: u8, const N: u8>(state: ResMut<ExecutorAuditState>) {
+        assert_ne!(state.bits & (1u32 << BEFORE), 0);
+        mark::<N>(state);
+    }
+
+    fn require_two<const A: u8, const B: u8, const N: u8>(state: ResMut<ExecutorAuditState>) {
+        assert_ne!(state.bits & (1u32 << A), 0);
+        assert_ne!(state.bits & (1u32 << B), 0);
+        mark::<N>(state);
+    }
+
+    fn blocked_by_system_condition(mut _state: ResMut<ExecutorAuditState>) {
+        panic!("system run condition did not skip the system");
+    }
+
+    fn blocked_by_set_condition(mut _state: ResMut<ExecutorAuditState>) {
+        panic!("set run condition did not skip the system");
+    }
+
+    fn audit_system_condition(gate: Res<ExecutorAuditGate>) -> bool {
+        gate.system_allowed
+    }
+
+    fn audit_set_condition(gate: Res<ExecutorAuditGate>) -> bool {
+        gate.set_allowed
+    }
+
+    fn queue_panicking_deferred(mut commands: Commands) {
+        commands.queue(|_: &mut World| panic!("deferred panic sentinel"));
+    }
+
+    fn run_executor_audit(configure: fn(&mut Schedule), multithreaded: bool) -> ExecutorAuditState {
+        let mut world = World::new();
+        world.init_resource::<ExecutorAuditState>();
+        world.init_resource::<ExecutorAuditGate>();
+
+        let mut schedule = Schedule::default();
+        if multithreaded {
+            schedule.set_executor(MultiThreadedExecutor::new());
+        } else {
+            schedule.set_executor(SingleThreadedExecutor::new());
+        }
+
+        configure(&mut schedule);
+        schedule.run(&mut world);
+        world.remove_resource::<ExecutorAuditState>().unwrap()
+    }
+
+    fn assert_executor_bits_match(configure: fn(&mut Schedule), expected_bits: u32) {
+        let single = run_executor_audit(configure, false);
+        let multi = run_executor_audit(configure, true);
+        assert_eq!(single.bits, expected_bits);
+        assert_eq!(multi.bits, expected_bits);
+    }
+
+    fn configure_chain(schedule: &mut Schedule) {
+        schedule.add_systems((mark::<0>, require::<0, 1>, require::<1, 2>).chain());
+    }
+
+    fn configure_diamond(schedule: &mut Schedule) {
+        schedule.add_systems((
+            mark::<0>,
+            require::<0, 1>.after(mark::<0>),
+            require::<0, 2>.after(mark::<0>),
+            require_two::<1, 2, 3>
+                .after(require::<0, 1>)
+                .after(require::<0, 2>),
+        ));
+    }
+
+    fn configure_run_condition_skips(schedule: &mut Schedule) {
+        schedule.configure_sets(ExecutorAuditSet.run_if(audit_set_condition));
+        schedule.add_systems((
+            blocked_by_system_condition.run_if(audit_system_condition),
+            mark::<4>.after(blocked_by_system_condition),
+            blocked_by_set_condition.in_set(ExecutorAuditSet),
+            mark::<5>.after(ExecutorAuditSet),
+        ));
     }
 
     #[test]
@@ -379,6 +484,43 @@ mod tests {
         let state = world.get_resource::<TestState>().unwrap();
         assert!(state.single_ran);
         assert!(state.populated_ran);
+    }
+
+    #[test]
+    fn single_and_multi_threaded_constrained_chain_match() {
+        let single = run_executor_audit(configure_chain, false);
+        let multi = run_executor_audit(configure_chain, true);
+        assert_eq!(single, multi);
+        assert_eq!(single.log, vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn single_and_multi_threaded_diamond_match_allowed_equivalence() {
+        assert_executor_bits_match(configure_diamond, 0b1111);
+    }
+
+    #[test]
+    fn single_and_multi_threaded_skipped_system_dependents_match() {
+        assert_executor_bits_match(configure_run_condition_skips, (1u32 << 4) | (1u32 << 5));
+    }
+
+    #[test]
+    fn deferred_application_panic_reaches_both_executors() {
+        fn panics_with_executor(multithreaded: bool) -> bool {
+            let mut world = World::new();
+            let mut schedule = Schedule::default();
+            if multithreaded {
+                schedule.set_executor(MultiThreadedExecutor::new());
+            } else {
+                schedule.set_executor(SingleThreadedExecutor::new());
+            }
+            schedule.add_systems((queue_panicking_deferred, ApplyDeferred).chain());
+
+            catch_unwind(AssertUnwindSafe(|| schedule.run(&mut world))).is_err()
+        }
+
+        assert!(panics_with_executor(false));
+        assert!(panics_with_executor(true));
     }
 
     fn look_for_missing_resource(_res: Res<TestState>) {}

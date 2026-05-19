@@ -42,6 +42,15 @@ mod imp {
         SCHEDULER_READY_SCAN_PASSES,
         SCHEDULER_READY_SYSTEMS_SCANNED,
         SCHEDULER_CONDITION_EVALUATIONS,
+        SCHEDULER_TASKS_SPAWNED,
+        SCHEDULER_EXCLUSIVE_TASKS_SPAWNED,
+        SCHEDULER_NON_SEND_TASKS_SPAWNED,
+        SCHEDULER_READY_TO_RUN_NANOS,
+        SCHEDULER_READY_TO_RUN_SAMPLES,
+        SCHEDULER_IDLE_READY_NANOS,
+        SCHEDULER_LOCK_HOLD_NANOS,
+        SCHEDULER_LOCK_HOLD_SAMPLES,
+        SCHEDULER_APPLY_DEFERRED_BITSET_REUSES,
         APPLY_DEFERRED_CALLS,
         APPLY_DEFERRED_SYSTEMS,
         APPLY_DEFERRED_NANOS,
@@ -78,6 +87,15 @@ mod imp {
         pub scheduler_ready_scan_passes: usize,
         pub scheduler_ready_systems_scanned: usize,
         pub scheduler_condition_evaluations: usize,
+        pub scheduler_tasks_spawned: usize,
+        pub scheduler_exclusive_tasks_spawned: usize,
+        pub scheduler_non_send_tasks_spawned: usize,
+        pub scheduler_ready_to_run_nanos: usize,
+        pub scheduler_ready_to_run_samples: usize,
+        pub scheduler_idle_ready_nanos: usize,
+        pub scheduler_lock_hold_nanos: usize,
+        pub scheduler_lock_hold_samples: usize,
+        pub scheduler_apply_deferred_bitset_reuses: usize,
         pub apply_deferred_calls: usize,
         pub apply_deferred_systems: usize,
         pub apply_deferred_nanos: usize,
@@ -241,6 +259,39 @@ mod imp {
     }
 
     #[inline]
+    pub(crate) fn scheduler_task_spawned(is_exclusive: bool, is_send: bool) {
+        inc(&SCHEDULER_TASKS_SPAWNED);
+        if is_exclusive {
+            inc(&SCHEDULER_EXCLUSIVE_TASKS_SPAWNED);
+        }
+        if !is_send {
+            inc(&SCHEDULER_NON_SEND_TASKS_SPAWNED);
+        }
+    }
+
+    #[inline]
+    pub(crate) fn scheduler_ready_to_run_delay(elapsed_nanos: usize) {
+        inc(&SCHEDULER_READY_TO_RUN_SAMPLES);
+        add(&SCHEDULER_READY_TO_RUN_NANOS, elapsed_nanos);
+    }
+
+    #[inline]
+    pub(crate) fn scheduler_idle_ready_wait(elapsed_nanos: usize) {
+        add(&SCHEDULER_IDLE_READY_NANOS, elapsed_nanos);
+    }
+
+    #[inline]
+    pub(crate) fn scheduler_lock_held(elapsed_nanos: usize) {
+        inc(&SCHEDULER_LOCK_HOLD_SAMPLES);
+        add(&SCHEDULER_LOCK_HOLD_NANOS, elapsed_nanos);
+    }
+
+    #[inline]
+    pub(crate) fn scheduler_apply_deferred_bitset_reuse() {
+        inc(&SCHEDULER_APPLY_DEFERRED_BITSET_REUSES);
+    }
+
+    #[inline]
     pub(crate) fn apply_deferred_finished(system_count: usize, elapsed_nanos: usize) {
         inc(&APPLY_DEFERRED_CALLS);
         add(&APPLY_DEFERRED_SYSTEMS, system_count);
@@ -302,6 +353,15 @@ mod imp {
             scheduler_ready_scan_passes: load(&SCHEDULER_READY_SCAN_PASSES),
             scheduler_ready_systems_scanned: load(&SCHEDULER_READY_SYSTEMS_SCANNED),
             scheduler_condition_evaluations: load(&SCHEDULER_CONDITION_EVALUATIONS),
+            scheduler_tasks_spawned: load(&SCHEDULER_TASKS_SPAWNED),
+            scheduler_exclusive_tasks_spawned: load(&SCHEDULER_EXCLUSIVE_TASKS_SPAWNED),
+            scheduler_non_send_tasks_spawned: load(&SCHEDULER_NON_SEND_TASKS_SPAWNED),
+            scheduler_ready_to_run_nanos: load(&SCHEDULER_READY_TO_RUN_NANOS),
+            scheduler_ready_to_run_samples: load(&SCHEDULER_READY_TO_RUN_SAMPLES),
+            scheduler_idle_ready_nanos: load(&SCHEDULER_IDLE_READY_NANOS),
+            scheduler_lock_hold_nanos: load(&SCHEDULER_LOCK_HOLD_NANOS),
+            scheduler_lock_hold_samples: load(&SCHEDULER_LOCK_HOLD_SAMPLES),
+            scheduler_apply_deferred_bitset_reuses: load(&SCHEDULER_APPLY_DEFERRED_BITSET_REUSES),
             apply_deferred_calls: load(&APPLY_DEFERRED_CALLS),
             apply_deferred_systems: load(&APPLY_DEFERRED_SYSTEMS),
             apply_deferred_nanos: load(&APPLY_DEFERRED_NANOS),
@@ -371,6 +431,32 @@ mod imp {
     #[inline]
     pub(crate) fn scheduler_condition_evaluations(_: usize) {}
     #[inline]
+    pub(crate) fn scheduler_task_spawned(_: bool, _: bool) {}
+    #[inline]
+    #[expect(
+        dead_code,
+        reason = "audit-only timing hooks are compiled out when bevy_ecs_audit is disabled"
+    )]
+    pub(crate) fn scheduler_ready_to_run_delay(_: usize) {}
+    #[inline]
+    #[expect(
+        dead_code,
+        reason = "audit-only timing hooks are compiled out when bevy_ecs_audit is disabled"
+    )]
+    pub(crate) fn scheduler_idle_ready_wait(_: usize) {}
+    #[inline]
+    #[expect(
+        dead_code,
+        reason = "audit-only timing hooks are compiled out when bevy_ecs_audit is disabled"
+    )]
+    pub(crate) fn scheduler_lock_held(_: usize) {}
+    #[inline]
+    pub(crate) fn scheduler_apply_deferred_bitset_reuse() {}
+    #[inline]
+    #[expect(
+        dead_code,
+        reason = "audit-only timing hooks are compiled out when bevy_ecs_audit is disabled"
+    )]
     pub(crate) fn apply_deferred_finished(_: usize, _: usize) {}
     #[inline]
     pub(crate) fn observer_trigger_scope() -> ObserverTriggerGuard {
@@ -395,6 +481,9 @@ mod tests {
         component::Component,
         event::Event,
         observer::On,
+        prelude::Resource,
+        schedule::{ApplyDeferred, IntoScheduleConfigs, MultiThreadedExecutor, Schedule},
+        system::{Commands, ResMut},
         world::{CommandQueue, World},
     };
 
@@ -407,6 +496,19 @@ mod tests {
 
     #[derive(Event)]
     struct AuditEvent;
+
+    #[derive(Resource, Default)]
+    struct AuditScheduleLog(usize);
+
+    fn audit_schedule_command(mut commands: Commands) {
+        commands.queue(|world: &mut World| {
+            world.resource_mut::<AuditScheduleLog>().0 += 1;
+        });
+    }
+
+    fn audit_schedule_system(mut log: ResMut<AuditScheduleLog>) {
+        log.0 += 1;
+    }
 
     #[test]
     fn audit_counters_record_representative_ecs_paths() {
@@ -437,6 +539,13 @@ mod tests {
         world.add_observer(|_: On<AuditEvent>| {});
         world.trigger(AuditEvent);
 
+        world.init_resource::<AuditScheduleLog>();
+        let mut schedule = Schedule::default();
+        schedule.set_executor(MultiThreadedExecutor::new());
+        schedule
+            .add_systems((audit_schedule_command, ApplyDeferred, audit_schedule_system).chain());
+        schedule.run(&mut world);
+
         let counters = super::snapshot();
         assert!(counters.query_update_archetypes > 0);
         assert!(counters.query_new_archetype_calls > 0);
@@ -449,6 +558,13 @@ mod tests {
         assert!(counters.command_queue_bytes_appended > 0);
         assert!(counters.command_queue_reallocations > 0);
         assert!(counters.command_queue_world_flushes > 0);
+        assert!(counters.scheduler_ready_scan_passes > 0);
+        assert!(counters.scheduler_tasks_spawned > 0);
+        assert!(counters.scheduler_exclusive_tasks_spawned > 0);
+        assert!(counters.scheduler_ready_to_run_samples > 0);
+        assert!(counters.scheduler_lock_hold_samples > 0);
+        assert!(counters.scheduler_apply_deferred_bitset_reuses > 0);
+        assert!(counters.apply_deferred_calls > 0);
         assert!(counters.observer_dispatches >= 1);
         assert!(counters.observer_max_trigger_depth > 0);
     }

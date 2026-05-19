@@ -8,6 +8,19 @@ use fixedbitset::FixedBitSet;
 #[cfg(feature = "std")]
 use std::eprintln;
 use std::sync::{Mutex, MutexGuard};
+#[cfg(all(feature = "std", feature = "bevy_ecs_audit"))]
+use std::time::Instant;
+
+#[cfg(feature = "bevy_ecs_audit")]
+macro_rules! audit {
+    ($($body:tt)*) => {
+        $($body)*
+    };
+}
+#[cfg(not(feature = "bevy_ecs_audit"))]
+macro_rules! audit {
+    ($($body:tt)*) => {};
+}
 
 #[cfg(feature = "trace")]
 use tracing::{info_span, Span};
@@ -82,6 +95,7 @@ struct SystemTaskMetadata {
 /// The result of running a system that is sent across a channel.
 struct SystemResult {
     system_index: usize,
+    recycled_unapplied_systems: Option<FixedBitSet>,
 }
 
 /// Runs the schedule using a thread pool. Non-conflicting systems can run in parallel.
@@ -128,6 +142,9 @@ pub struct ExecutorState {
     completed_systems: FixedBitSet,
     /// Systems that have run but have not had their buffers applied.
     unapplied_systems: FixedBitSet,
+    /// The instant each system entered `ready_systems`.
+    #[cfg(feature = "bevy_ecs_audit")]
+    ready_since: Vec<Option<Instant>>,
 }
 
 /// References to data required by the executor.
@@ -163,6 +180,7 @@ impl SystemExecutor for MultiThreadedExecutor {
         state.completed_systems = FixedBitSet::with_capacity(sys_count);
         state.skipped_systems = FixedBitSet::with_capacity(sys_count);
         state.unapplied_systems = FixedBitSet::with_capacity(sys_count);
+        audit! { state.ready_since = alloc::vec![None; sys_count]; }
 
         state.system_task_metadata = Vec::with_capacity(sys_count);
         for index in 0..sys_count {
@@ -247,6 +265,15 @@ impl SystemExecutor for MultiThreadedExecutor {
             .num_dependencies_remaining
             .clone_from(&schedule.system_dependencies);
         state.ready_systems.clone_from(&self.starting_systems);
+        audit! {
+            for ready_since in &mut state.ready_since {
+                *ready_since = None;
+            }
+            let now = Instant::now();
+            for system_index in state.ready_systems.ones() {
+                state.ready_since[system_index] = Some(now);
+            }
+        }
 
         // If stepping is enabled, make sure we skip those systems that should
         // not be run.
@@ -261,6 +288,7 @@ impl SystemExecutor for MultiThreadedExecutor {
             for system_index in skipped_systems.ones() {
                 state.signal_dependents(system_index);
                 state.ready_systems.remove(system_index);
+                audit! { state.ready_since[system_index] = None; }
             }
         }
 
@@ -327,11 +355,24 @@ impl<'scope, 'env: 'scope, 'sys> Context<'scope, 'env, 'sys> {
         res: Result<(), Box<dyn Any + Send>>,
         system: &ScheduleSystem,
     ) {
+        self.system_completed_with_recycled_unapplied(system_index, res, system, None);
+    }
+
+    fn system_completed_with_recycled_unapplied(
+        &self,
+        system_index: usize,
+        res: Result<(), Box<dyn Any + Send>>,
+        system: &ScheduleSystem,
+        recycled_unapplied_systems: Option<FixedBitSet>,
+    ) {
         // tell the executor that the system finished
         self.environment
             .executor
             .system_completion
-            .push(SystemResult { system_index })
+            .push(SystemResult {
+                system_index,
+                recycled_unapplied_systems,
+            })
             .unwrap_or_else(|error| unreachable!("{}", error));
         if let Err(payload) = res {
             #[cfg(feature = "std")]
@@ -373,7 +414,10 @@ impl<'scope, 'env: 'scope, 'sys> Context<'scope, 'env, 'sys> {
             let Some((conditions, mut guard)) = self.try_lock() else {
                 return;
             };
+            #[cfg(feature = "bevy_ecs_audit")]
+            let audit_lock_start = Instant::now();
             guard.tick(self, conditions);
+            audit! { crate::audit::scheduler_lock_held(elapsed_nanos(audit_lock_start)); }
             // Make sure we drop the guard before checking system_completion.is_empty(), or we could lose events.
             drop(guard);
             if self.environment.executor.system_completion.is_empty() {
@@ -416,6 +460,8 @@ impl ExecutorState {
             skipped_systems: FixedBitSet::new(),
             completed_systems: FixedBitSet::new(),
             unapplied_systems: FixedBitSet::new(),
+            #[cfg(feature = "bevy_ecs_audit")]
+            ready_since: Vec::new(),
         }
     }
 
@@ -470,6 +516,10 @@ impl ExecutorState {
         let mut check_for_new_ready_systems = true;
         while check_for_new_ready_systems {
             check_for_new_ready_systems = false;
+            #[cfg(feature = "bevy_ecs_audit")]
+            let audit_scan_start = Instant::now();
+            #[cfg(feature = "bevy_ecs_audit")]
+            let mut audit_spawned_systems = 0usize;
 
             ready_systems.clone_from(&self.ready_systems);
             crate::audit::scheduler_ready_scan(ready_systems.count_ones(..));
@@ -510,10 +560,16 @@ impl ExecutorState {
                         context.error_handler,
                     )
                 } {
+                    audit! { self.audit_ready_system_left_queue(system_index); }
                     self.skip_system_and_signal_dependents(system_index);
                     // signal_dependents may have set more systems to ready.
                     check_for_new_ready_systems = true;
                     continue;
+                }
+
+                audit! {
+                    self.audit_ready_system_left_queue(system_index);
+                    audit_spawned_systems += 1;
                 }
 
                 self.running_systems.insert(system_index);
@@ -536,6 +592,12 @@ impl ExecutorState {
                 // - `can_run` returned true, so no systems with conflicting world access are running.
                 unsafe {
                     self.spawn_system_task(context, system_index);
+                }
+            }
+
+            audit! {
+                if audit_spawned_systems == 0 && !self.ready_systems.is_clear() {
+                    crate::audit::scheduler_idle_ready_wait(elapsed_nanos(audit_scan_start));
                 }
             }
         }
@@ -658,6 +720,7 @@ impl ExecutorState {
         let context = *context;
 
         let system_meta = &self.system_task_metadata[system_index];
+        crate::audit::scheduler_task_spawned(false, system_meta.is_send);
 
         let task = async move {
             let res = std::panic::catch_unwind(AssertUnwindSafe(|| {
@@ -700,17 +763,24 @@ impl ExecutorState {
         let system = &mut unsafe { &mut *context.environment.systems[system_index].get() }.system;
         // Move the full context object into the new future.
         let context = *context;
+        let system_meta = &self.system_task_metadata[system_index];
+        crate::audit::scheduler_task_spawned(true, system_meta.is_send);
 
         if is_apply_deferred(&**system) {
-            // TODO: avoid allocation
-            let unapplied_systems = self.unapplied_systems.clone();
-            self.unapplied_systems.clear();
+            let mut unapplied_systems = core::mem::take(&mut self.unapplied_systems);
+            crate::audit::scheduler_apply_deferred_bitset_reuse();
             let task = async move {
                 // SAFETY: `can_run` returned true for this system, which means
                 // that no other systems currently have access to the world.
                 let world = unsafe { context.environment.world_cell.world_mut() };
                 let res = apply_deferred(&unapplied_systems, context.environment.systems, world);
-                context.system_completed(system_index, res, system);
+                unapplied_systems.clear();
+                context.system_completed_with_recycled_unapplied(
+                    system_index,
+                    res,
+                    system,
+                    Some(unapplied_systems),
+                );
             };
 
             context.scope.spawn_on_scope(task);
@@ -743,7 +813,17 @@ impl ExecutorState {
     }
 
     fn finish_system_and_handle_dependents(&mut self, result: SystemResult) {
-        let SystemResult { system_index, .. } = result;
+        let SystemResult {
+            system_index,
+            recycled_unapplied_systems,
+        } = result;
+
+        if let Some(recycled_unapplied_systems) = recycled_unapplied_systems {
+            debug_assert!(self.unapplied_systems.is_clear());
+            if self.unapplied_systems.is_clear() {
+                self.unapplied_systems = recycled_unapplied_systems;
+            }
+        }
 
         if self.system_task_metadata[system_index].is_exclusive {
             self.exclusive_running = false;
@@ -774,7 +854,15 @@ impl ExecutorState {
             *remaining -= 1;
             if *remaining == 0 && !self.completed_systems.contains(dep_idx) {
                 self.ready_systems.insert(dep_idx);
+                audit! { self.ready_since[dep_idx] = Some(Instant::now()); }
             }
+        }
+    }
+
+    #[cfg(feature = "bevy_ecs_audit")]
+    fn audit_ready_system_left_queue(&mut self, system_index: usize) {
+        if let Some(ready_since) = self.ready_since[system_index].take() {
+            crate::audit::scheduler_ready_to_run_delay(elapsed_nanos(ready_since));
         }
     }
 }
@@ -784,10 +872,12 @@ fn apply_deferred(
     systems: &[SyncUnsafeCell<SystemWithAccess>],
     world: &mut World,
 ) -> Result<(), Box<dyn Any + Send>> {
-    let audit_start = std::time::Instant::now();
+    #[cfg(feature = "bevy_ecs_audit")]
+    let audit_start = Instant::now();
+    #[cfg(feature = "bevy_ecs_audit")]
     let mut audit_system_count = 0;
     for system_index in unapplied_systems.ones() {
-        audit_system_count += 1;
+        audit! { audit_system_count += 1; }
         // SAFETY: none of these systems are running, no other references exist
         let system = &mut unsafe { &mut *systems[system_index].get() }.system;
         let res = std::panic::catch_unwind(AssertUnwindSafe(|| {
@@ -805,11 +895,19 @@ fn apply_deferred(
             return Err(payload);
         }
     }
-    crate::audit::apply_deferred_finished(
-        audit_system_count,
-        audit_start.elapsed().as_nanos().min(usize::MAX as u128) as usize,
-    );
+    audit! {
+        crate::audit::apply_deferred_finished(
+            audit_system_count,
+            audit_start.elapsed().as_nanos().min(usize::MAX as u128) as usize,
+        );
+    }
     Ok(())
+}
+
+#[cfg(feature = "bevy_ecs_audit")]
+#[inline]
+fn elapsed_nanos(start: Instant) -> usize {
+    start.elapsed().as_nanos().min(usize::MAX as u128) as usize
 }
 
 /// # Safety

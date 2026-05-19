@@ -9,6 +9,17 @@ use tracing::info_span;
 #[cfg(feature = "std")]
 use std::eprintln;
 
+#[cfg(feature = "bevy_ecs_audit")]
+macro_rules! audit {
+    ($($body:tt)*) => {
+        $($body)*
+    };
+}
+#[cfg(not(feature = "bevy_ecs_audit"))]
+macro_rules! audit {
+    ($($body:tt)*) => {};
+}
+
 use crate::{
     error::{ErrorContext, ErrorHandler},
     schedule::{is_apply_deferred, ConditionWithAccess, SystemExecutor, SystemSchedule},
@@ -188,9 +199,20 @@ impl SingleThreadedExecutor {
     }
 
     fn apply_deferred(&mut self, schedule: &mut SystemSchedule, world: &mut World) {
+        #[cfg(feature = "bevy_ecs_audit")]
+        let audit_start = std::time::Instant::now();
+        #[cfg(feature = "bevy_ecs_audit")]
+        let mut audit_system_count = 0;
         for system_index in self.unapplied_systems.ones() {
+            audit! { audit_system_count += 1; }
             let system = &mut schedule.systems[system_index].system;
             system.apply_deferred(world);
+        }
+        audit! {
+            crate::audit::apply_deferred_finished(
+                audit_system_count,
+                audit_start.elapsed().as_nanos().min(usize::MAX as u128) as usize,
+            );
         }
 
         self.unapplied_systems.clear();
