@@ -30,6 +30,8 @@ use crate::{
 };
 use alloc::{boxed::Box, vec::Vec};
 use bevy_platform::collections::{hash_map::Entry, HashMap};
+#[cfg(feature = "bevy_ecs_audit")]
+use core::mem::size_of;
 use core::{
     hash::Hash,
     ops::{Index, IndexMut, RangeFrom},
@@ -155,6 +157,19 @@ impl ArchetypeAfterBundleInsert {
     pub(crate) fn existing(&self) -> &[ComponentId] {
         // SAFETY: `added_len` is always in range `0..=inserted.len()`
         unsafe { self.inserted.get(self.added_len..).debug_checked_unwrap() }
+    }
+
+    #[cfg(feature = "bevy_ecs_audit")]
+    fn audit_retained_bytes(&self) -> usize {
+        self.bundle_status
+            .len()
+            .saturating_mul(size_of::<ComponentStatus>())
+            .saturating_add(
+                self.required_components
+                    .len()
+                    .saturating_mul(size_of::<RequiredComponentConstructor>()),
+            )
+            .saturating_add(self.inserted.len().saturating_mul(size_of::<ComponentId>()))
     }
 }
 
@@ -328,6 +343,39 @@ impl Edges {
         self.insert_bundle.audit_slot_count()
             + self.remove_bundle.audit_slot_count()
             + self.take_bundle.audit_slot_count()
+    }
+
+    #[cfg(feature = "bevy_ecs_audit")]
+    pub(crate) fn audit_slot_capacity(&self) -> usize {
+        self.insert_bundle.audit_slot_capacity()
+            + self.remove_bundle.audit_slot_capacity()
+            + self.take_bundle.audit_slot_capacity()
+    }
+
+    #[cfg(feature = "bevy_ecs_audit")]
+    fn audit_retained_bytes(&self) -> usize {
+        let insert_slots = self
+            .insert_bundle
+            .audit_slot_capacity()
+            .saturating_mul(size_of::<Option<ArchetypeAfterBundleInsert>>());
+        let remove_slots = self
+            .remove_bundle
+            .audit_slot_capacity()
+            .saturating_mul(size_of::<Option<Option<ArchetypeId>>>());
+        let take_slots = self
+            .take_bundle
+            .audit_slot_capacity()
+            .saturating_mul(size_of::<Option<Option<ArchetypeId>>>());
+        let insert_payloads = self
+            .insert_bundle
+            .iter()
+            .map(|(_, edge)| edge.audit_retained_bytes())
+            .sum::<usize>();
+
+        insert_slots
+            .saturating_add(remove_slots)
+            .saturating_add(take_slots)
+            .saturating_add(insert_payloads)
     }
 }
 
@@ -566,6 +614,15 @@ impl Archetype {
         &self.edges
     }
 
+    #[cfg(feature = "bevy_ecs_audit")]
+    pub(crate) fn audit_retained_bytes(&self) -> usize {
+        self.entities
+            .capacity()
+            .saturating_mul(size_of::<ArchetypeEntity>())
+            .saturating_add(self.components.audit_retained_bytes())
+            .saturating_add(self.edges.audit_retained_bytes())
+    }
+
     /// Fetches a mutable reference to the archetype's [`Edges`], a cache of
     /// archetypal relationships.
     #[inline]
@@ -772,6 +829,20 @@ impl ArchetypeGeneration {
 struct ArchetypeComponents {
     table_components: Box<[ComponentId]>,
     sparse_set_components: Box<[ComponentId]>,
+}
+
+impl ArchetypeComponents {
+    #[cfg(feature = "bevy_ecs_audit")]
+    fn audit_retained_bytes(&self) -> usize {
+        self.table_components
+            .len()
+            .saturating_mul(size_of::<ComponentId>())
+            .saturating_add(
+                self.sparse_set_components
+                    .len()
+                    .saturating_mul(size_of::<ComponentId>()),
+            )
+    }
 }
 
 /// Maps a [`ComponentId`] to the list of [`Archetypes`]([`Archetype`]) that contain the [`Component`](crate::component::Component),
@@ -982,6 +1053,56 @@ impl Archetypes {
             .iter()
             .map(|archetype| archetype.edges.audit_slot_count())
             .sum()
+    }
+
+    #[cfg(feature = "bevy_ecs_audit")]
+    pub(crate) fn audit_edge_capacity(&self) -> usize {
+        self.archetypes
+            .iter()
+            .map(|archetype| archetype.edges.audit_slot_capacity())
+            .sum()
+    }
+
+    #[cfg(feature = "bevy_ecs_audit")]
+    pub(crate) fn audit_retained_bytes(&self) -> usize {
+        let archetype_slots = self
+            .archetypes
+            .capacity()
+            .saturating_mul(size_of::<Archetype>());
+        let archetype_payloads = self
+            .archetypes
+            .iter()
+            .map(Archetype::audit_retained_bytes)
+            .sum::<usize>();
+        let by_components_slots = self
+            .by_components
+            .capacity()
+            .saturating_mul(size_of::<(ArchetypeComponents, ArchetypeId)>());
+        let by_components_payloads = self
+            .by_components
+            .keys()
+            .map(ArchetypeComponents::audit_retained_bytes)
+            .sum::<usize>();
+        let by_component_slots = self.by_component.capacity().saturating_mul(size_of::<(
+            ComponentId,
+            HashMap<ArchetypeId, ArchetypeRecord>,
+        )>());
+        let by_component_payloads = self
+            .by_component
+            .values()
+            .map(|records| {
+                records
+                    .capacity()
+                    .saturating_mul(size_of::<(ArchetypeId, ArchetypeRecord)>())
+            })
+            .sum::<usize>();
+
+        archetype_slots
+            .saturating_add(archetype_payloads)
+            .saturating_add(by_components_slots)
+            .saturating_add(by_components_payloads)
+            .saturating_add(by_component_slots)
+            .saturating_add(by_component_payloads)
     }
 
     /// Get the component index

@@ -121,6 +121,8 @@ use crate::{
     storage::{SparseSetIndex, TableId, TableRow},
 };
 use alloc::vec::Vec;
+#[cfg(feature = "bevy_ecs_audit")]
+use core::mem::size_of;
 use core::{fmt, hash::Hash, mem, num::NonZero, panic::Location};
 use derive_more::derive::Display;
 use log::warn;
@@ -1081,6 +1083,16 @@ impl Entities {
     #[inline]
     pub fn len(&self) -> u32 {
         self.meta.len() as u32
+    }
+
+    #[cfg(feature = "bevy_ecs_audit")]
+    pub(crate) fn audit_meta_capacity(&self) -> usize {
+        self.meta.capacity()
+    }
+
+    #[cfg(feature = "bevy_ecs_audit")]
+    pub(crate) fn audit_meta_retained_bytes(&self) -> usize {
+        self.meta.capacity().saturating_mul(size_of::<EntityMeta>())
     }
 
     /// Checks if any entity has been declared.

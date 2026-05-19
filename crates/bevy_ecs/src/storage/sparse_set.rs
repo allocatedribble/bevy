@@ -7,6 +7,8 @@ use crate::{
 };
 use alloc::{boxed::Box, vec::Vec};
 use bevy_ptr::{OwningPtr, Ptr};
+#[cfg(feature = "bevy_ecs_audit")]
+use core::mem::size_of;
 use core::{cell::UnsafeCell, hash::Hash, marker::PhantomData, num::NonZero, panic::Location};
 use nonmax::{NonMaxU32, NonMaxUsize};
 
@@ -133,6 +135,11 @@ impl<I: SparseSetIndex, V> SparseArray<I, V> {
         self.values.len()
     }
 
+    #[cfg(feature = "bevy_ecs_audit")]
+    pub(crate) fn audit_slot_capacity(&self) -> usize {
+        self.values.capacity()
+    }
+
     #[cfg(any(test, feature = "bevy_ecs_audit"))]
     pub(crate) fn audit_entry_count(&self) -> usize {
         self.values.iter().filter(|value| value.is_some()).count()
@@ -157,6 +164,13 @@ impl<I: SparseSetIndex, V> SparseArray<I, V> {
                 .as_ref()
                 .map(|value| (SparseSetIndex::get_sparse_set_index(index), value))
         })
+    }
+}
+
+impl<I: SparseSetIndex, V> ImmutableSparseArray<I, V> {
+    #[cfg(feature = "bevy_ecs_audit")]
+    pub(crate) fn audit_slot_count(&self) -> usize {
+        self.values.len()
     }
 }
 
@@ -498,9 +512,35 @@ impl ComponentSparseSet {
         self.sparse.audit_slot_count()
     }
 
+    #[cfg(feature = "bevy_ecs_audit")]
+    pub(crate) fn audit_sparse_slot_capacity(&self) -> usize {
+        self.sparse.audit_slot_capacity()
+    }
+
     #[cfg(any(test, feature = "bevy_ecs_audit"))]
     pub(crate) fn audit_entity_capacity(&self) -> usize {
         self.entities.capacity()
+    }
+
+    #[cfg(feature = "bevy_ecs_audit")]
+    pub(crate) fn audit_retained_bytes(&self) -> usize {
+        #[cfg(debug_assertions)]
+        let entity_bytes = self.entities.capacity().saturating_mul(size_of::<Entity>());
+        #[cfg(not(debug_assertions))]
+        let entity_bytes = self
+            .entities
+            .capacity()
+            .saturating_mul(size_of::<EntityIndex>());
+
+        let dense_bytes = self.dense.audit_retained_bytes(self.entities.capacity());
+        let sparse_bytes = self
+            .sparse
+            .audit_slot_capacity()
+            .saturating_mul(size_of::<Option<TableRow>>());
+
+        entity_bytes
+            .saturating_add(dense_bytes)
+            .saturating_add(sparse_bytes)
     }
 
     #[cfg(test)]
@@ -697,6 +737,21 @@ macro_rules! impl_sparse_set {
 impl_sparse_set!(SparseSet);
 impl_sparse_set!(ImmutableSparseSet);
 
+impl<I: SparseSetIndex, V> ImmutableSparseSet<I, V> {
+    #[cfg(feature = "bevy_ecs_audit")]
+    pub(crate) fn audit_retained_bytes(&self) -> usize {
+        self.dense
+            .len()
+            .saturating_mul(size_of::<V>())
+            .saturating_add(self.indices.len().saturating_mul(size_of::<I>()))
+            .saturating_add(
+                self.sparse
+                    .audit_slot_count()
+                    .saturating_mul(size_of::<Option<NonMaxUsize>>()),
+            )
+    }
+}
+
 impl<I: SparseSetIndex, V> Default for SparseSet<I, V> {
     fn default() -> Self {
         Self::new()
@@ -808,6 +863,19 @@ impl<I: SparseSetIndex, V> SparseSet<I, V> {
         self.dense.clear();
         self.indices.clear();
         self.sparse.clear();
+    }
+
+    #[cfg(feature = "bevy_ecs_audit")]
+    pub(crate) fn audit_retained_bytes(&self) -> usize {
+        self.dense
+            .capacity()
+            .saturating_mul(size_of::<V>())
+            .saturating_add(self.indices.capacity().saturating_mul(size_of::<I>()))
+            .saturating_add(
+                self.sparse
+                    .audit_slot_capacity()
+                    .saturating_mul(size_of::<Option<NonMaxUsize>>()),
+            )
     }
 
     /// Converts the sparse set into its immutable variant.
@@ -943,6 +1011,24 @@ impl SparseSets {
             .values()
             .map(ComponentSparseSet::audit_sparse_slot_count)
             .sum()
+    }
+
+    #[cfg(feature = "bevy_ecs_audit")]
+    pub(crate) fn audit_sparse_slot_capacity(&self) -> usize {
+        self.sets
+            .values()
+            .map(ComponentSparseSet::audit_sparse_slot_capacity)
+            .sum()
+    }
+
+    #[cfg(feature = "bevy_ecs_audit")]
+    pub(crate) fn audit_retained_bytes(&self) -> usize {
+        self.sets.audit_retained_bytes().saturating_add(
+            self.sets
+                .values()
+                .map(ComponentSparseSet::audit_retained_bytes)
+                .sum(),
+        )
     }
 
     #[cfg(test)]

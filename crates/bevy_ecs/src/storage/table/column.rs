@@ -3,6 +3,8 @@ use crate::{
     change_detection::MaybeLocation,
     storage::{blob_array::BlobArray, thin_array_ptr::ThinArrayPtr},
 };
+#[cfg(feature = "bevy_ecs_audit")]
+use core::mem::size_of;
 use core::{mem::needs_drop, panic::Location};
 
 /// A type-erased contiguous container for data of a homogeneous type.
@@ -43,6 +45,24 @@ impl Column {
             changed_ticks: ThinArrayPtr::with_capacity(capacity),
             changed_by: MaybeLocation::new_with(|| ThinArrayPtr::with_capacity(capacity)),
         }
+    }
+
+    #[cfg(feature = "bevy_ecs_audit")]
+    pub(crate) fn audit_retained_bytes(&self, capacity: usize) -> usize {
+        let component_bytes = self.data.layout().size().saturating_mul(capacity);
+        let tick_bytes = size_of::<UnsafeCell<Tick>>()
+            .saturating_mul(capacity)
+            .saturating_mul(2);
+        let changed_by_bytes = self
+            .changed_by
+            .as_ref()
+            .into_option()
+            .map(|_| size_of::<UnsafeCell<&'static Location<'static>>>().saturating_mul(capacity))
+            .unwrap_or(0);
+
+        component_bytes
+            .saturating_add(tick_bytes)
+            .saturating_add(changed_by_bytes)
     }
 
     /// Swap-remove and drop the removed element, but the component at `row` must not be the last element.

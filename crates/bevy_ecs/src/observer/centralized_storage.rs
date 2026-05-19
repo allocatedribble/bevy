@@ -15,6 +15,8 @@ use crate::{
     archetype::ArchetypeFlags, component::ComponentId, entity::EntityHashMap, event::EventKey,
     observer::ObserverRunner,
 };
+#[cfg(feature = "bevy_ecs_audit")]
+use core::mem::size_of;
 
 /// An internal lookup table tracking all of the observers in the world.
 ///
@@ -126,6 +128,69 @@ impl Observers {
             self.cache.remove(&event_key);
         }
     }
+
+    #[cfg(feature = "bevy_ecs_audit")]
+    pub(crate) fn audit_event_cache_entries(&self) -> usize {
+        self.cache.len()
+    }
+
+    #[cfg(feature = "bevy_ecs_audit")]
+    pub(crate) fn audit_event_cache_capacity(&self) -> usize {
+        self.cache.capacity()
+    }
+
+    #[cfg(feature = "bevy_ecs_audit")]
+    pub(crate) fn audit_runner_entries(&self) -> usize {
+        self.add
+            .audit_runner_entries()
+            .saturating_add(self.insert.audit_runner_entries())
+            .saturating_add(self.discard.audit_runner_entries())
+            .saturating_add(self.remove.audit_runner_entries())
+            .saturating_add(self.despawn.audit_runner_entries())
+            .saturating_add(
+                self.cache
+                    .values()
+                    .map(CachedObservers::audit_runner_entries)
+                    .sum(),
+            )
+    }
+
+    #[cfg(feature = "bevy_ecs_audit")]
+    pub(crate) fn audit_runner_capacity(&self) -> usize {
+        self.add
+            .audit_runner_capacity()
+            .saturating_add(self.insert.audit_runner_capacity())
+            .saturating_add(self.discard.audit_runner_capacity())
+            .saturating_add(self.remove.audit_runner_capacity())
+            .saturating_add(self.despawn.audit_runner_capacity())
+            .saturating_add(
+                self.cache
+                    .values()
+                    .map(CachedObservers::audit_runner_capacity)
+                    .sum(),
+            )
+    }
+
+    #[cfg(feature = "bevy_ecs_audit")]
+    pub(crate) fn audit_retained_bytes(&self) -> usize {
+        self.cache
+            .capacity()
+            .saturating_mul(size_of::<(EventKey, CachedObservers)>())
+            .saturating_add(
+                self.add
+                    .audit_retained_bytes()
+                    .saturating_add(self.insert.audit_retained_bytes())
+                    .saturating_add(self.discard.audit_retained_bytes())
+                    .saturating_add(self.remove.audit_retained_bytes())
+                    .saturating_add(self.despawn.audit_retained_bytes()),
+            )
+            .saturating_add(
+                self.cache
+                    .values()
+                    .map(CachedObservers::audit_retained_bytes)
+                    .sum(),
+            )
+    }
 }
 
 /// Collection of [`ObserverRunner`] for [`Observer`](crate::observer::Observer) registered to a particular event.
@@ -165,6 +230,70 @@ impl CachedObservers {
             && self.component_observers.is_empty()
             && self.entity_observers.is_empty()
     }
+
+    #[cfg(feature = "bevy_ecs_audit")]
+    fn audit_runner_entries(&self) -> usize {
+        self.global_observers
+            .len()
+            .saturating_add(
+                self.component_observers
+                    .values()
+                    .map(CachedComponentObservers::audit_runner_entries)
+                    .sum(),
+            )
+            .saturating_add(self.entity_observers.values().map(|map| map.len()).sum())
+    }
+
+    #[cfg(feature = "bevy_ecs_audit")]
+    fn audit_runner_capacity(&self) -> usize {
+        self.global_observers
+            .capacity()
+            .saturating_add(
+                self.component_observers
+                    .values()
+                    .map(CachedComponentObservers::audit_runner_capacity)
+                    .sum(),
+            )
+            .saturating_add(
+                self.entity_observers
+                    .values()
+                    .map(|map| map.capacity())
+                    .sum(),
+            )
+    }
+
+    #[cfg(feature = "bevy_ecs_audit")]
+    fn audit_retained_bytes(&self) -> usize {
+        self.global_observers
+            .capacity()
+            .saturating_mul(size_of::<(crate::entity::Entity, ObserverRunner)>())
+            .saturating_add(
+                self.component_observers
+                    .capacity()
+                    .saturating_mul(size_of::<(ComponentId, CachedComponentObservers)>()),
+            )
+            .saturating_add(
+                self.component_observers
+                    .values()
+                    .map(CachedComponentObservers::audit_retained_bytes)
+                    .sum(),
+            )
+            .saturating_add(
+                self.entity_observers
+                    .capacity()
+                    .saturating_mul(size_of::<(crate::entity::Entity, ObserverMap)>()),
+            )
+            .saturating_add(
+                self.entity_observers
+                    .values()
+                    .map(|observers| {
+                        observers
+                            .capacity()
+                            .saturating_mul(size_of::<(crate::entity::Entity, ObserverRunner)>())
+                    })
+                    .sum(),
+            )
+    }
 }
 
 /// Map between an observer entity and its [`ObserverRunner`]
@@ -195,5 +324,47 @@ impl CachedComponentObservers {
     /// Returns `true` if no observer runners are cached for this component.
     pub fn is_empty(&self) -> bool {
         self.global_observers.is_empty() && self.entity_component_observers.is_empty()
+    }
+
+    #[cfg(feature = "bevy_ecs_audit")]
+    fn audit_runner_entries(&self) -> usize {
+        self.global_observers.len().saturating_add(
+            self.entity_component_observers
+                .values()
+                .map(|map| map.len())
+                .sum(),
+        )
+    }
+
+    #[cfg(feature = "bevy_ecs_audit")]
+    fn audit_runner_capacity(&self) -> usize {
+        self.global_observers.capacity().saturating_add(
+            self.entity_component_observers
+                .values()
+                .map(|map| map.capacity())
+                .sum(),
+        )
+    }
+
+    #[cfg(feature = "bevy_ecs_audit")]
+    fn audit_retained_bytes(&self) -> usize {
+        self.global_observers
+            .capacity()
+            .saturating_mul(size_of::<(crate::entity::Entity, ObserverRunner)>())
+            .saturating_add(
+                self.entity_component_observers
+                    .capacity()
+                    .saturating_mul(size_of::<(crate::entity::Entity, ObserverMap)>()),
+            )
+            .saturating_add(
+                self.entity_component_observers
+                    .values()
+                    .map(|observers| {
+                        observers
+                            .capacity()
+                            .saturating_mul(size_of::<(crate::entity::Entity, ObserverRunner)>())
+                    })
+                    .sum(),
+            )
     }
 }

@@ -141,6 +141,7 @@ mod imp {
         pub empty_archetype_count: usize,
         pub archetype_edge_entries: usize,
         pub archetype_edge_slots: usize,
+        pub archetype_edge_capacity: usize,
         pub table_count: usize,
         pub empty_table_count: usize,
         pub table_entity_count: usize,
@@ -150,6 +151,43 @@ mod imp {
         pub sparse_set_entity_count: usize,
         pub sparse_set_entity_capacity: usize,
         pub sparse_set_sparse_slots: usize,
+        pub sparse_set_sparse_capacity: usize,
+    }
+
+    #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+    pub struct MemoryMetrics {
+        pub estimated_retained_bytes: usize,
+        pub entity_meta_len: usize,
+        pub entity_meta_capacity: usize,
+        pub entity_meta_retained_bytes: usize,
+        pub archetype_count: usize,
+        pub empty_archetype_count: usize,
+        pub archetype_edge_entries: usize,
+        pub archetype_edge_slots: usize,
+        pub archetype_edge_capacity: usize,
+        pub archetype_retained_bytes: usize,
+        pub table_count: usize,
+        pub empty_table_count: usize,
+        pub table_entity_count: usize,
+        pub table_entity_capacity: usize,
+        pub table_entity_retained_bytes: usize,
+        pub table_column_count: usize,
+        pub table_column_retained_bytes: usize,
+        pub sparse_set_count: usize,
+        pub sparse_set_entity_count: usize,
+        pub sparse_set_entity_capacity: usize,
+        pub sparse_set_sparse_slots: usize,
+        pub sparse_set_sparse_capacity: usize,
+        pub sparse_set_retained_bytes: usize,
+        pub command_queue_len_bytes: usize,
+        pub command_queue_capacity_bytes: usize,
+        pub command_queue_panic_recovery_len_bytes: usize,
+        pub command_queue_panic_recovery_capacity_bytes: usize,
+        pub observer_event_cache_entries: usize,
+        pub observer_event_cache_capacity: usize,
+        pub observer_runner_entries: usize,
+        pub observer_runner_capacity: usize,
+        pub observer_retained_bytes: usize,
     }
 
     #[inline]
@@ -498,6 +536,7 @@ mod imp {
             empty_archetype_count: world.archetypes().audit_empty_count(),
             archetype_edge_entries: world.archetypes().audit_edge_entries(),
             archetype_edge_slots: world.archetypes().audit_edge_slots(),
+            archetype_edge_capacity: world.archetypes().audit_edge_capacity(),
             table_count: storages.tables.len(),
             empty_table_count: storages.tables.audit_empty_count(),
             table_entity_count: storages.tables.audit_entity_count(),
@@ -507,6 +546,71 @@ mod imp {
             sparse_set_entity_count: storages.sparse_sets.audit_entity_count(),
             sparse_set_entity_capacity: storages.sparse_sets.audit_entity_capacity(),
             sparse_set_sparse_slots: storages.sparse_sets.audit_sparse_slot_count(),
+            sparse_set_sparse_capacity: storages.sparse_sets.audit_sparse_slot_capacity(),
+        }
+    }
+
+    pub fn memory_metrics(world: &crate::world::World) -> MemoryMetrics {
+        let storages = world.storages();
+        let archetypes = world.archetypes();
+        let command_queue = &world.command_queue;
+        let (command_queue_len_bytes, command_queue_capacity_bytes) = unsafe {
+            let bytes = command_queue.bytes.as_ref();
+            (bytes.len(), bytes.capacity())
+        };
+        let (command_queue_panic_recovery_len_bytes, command_queue_panic_recovery_capacity_bytes) = unsafe {
+            let bytes = command_queue.panic_recovery.as_ref();
+            (bytes.len(), bytes.capacity())
+        };
+        let entity_meta_retained_bytes = world.entities().audit_meta_retained_bytes();
+        let archetype_retained_bytes = archetypes.audit_retained_bytes();
+        let table_entity_retained_bytes = storages.tables.audit_entity_retained_bytes();
+        let table_column_retained_bytes = storages.tables.audit_column_retained_bytes();
+        let sparse_set_retained_bytes = storages.sparse_sets.audit_retained_bytes();
+        let command_queue_retained_bytes = command_queue_capacity_bytes
+            .saturating_add(command_queue_panic_recovery_capacity_bytes);
+        let observer_retained_bytes = world.observers().audit_retained_bytes();
+        let estimated_retained_bytes = entity_meta_retained_bytes
+            .saturating_add(archetype_retained_bytes)
+            .saturating_add(table_entity_retained_bytes)
+            .saturating_add(table_column_retained_bytes)
+            .saturating_add(sparse_set_retained_bytes)
+            .saturating_add(command_queue_retained_bytes)
+            .saturating_add(observer_retained_bytes);
+
+        MemoryMetrics {
+            estimated_retained_bytes,
+            entity_meta_len: world.entities().len() as usize,
+            entity_meta_capacity: world.entities().audit_meta_capacity(),
+            entity_meta_retained_bytes,
+            archetype_count: archetypes.len(),
+            empty_archetype_count: archetypes.audit_empty_count(),
+            archetype_edge_entries: archetypes.audit_edge_entries(),
+            archetype_edge_slots: archetypes.audit_edge_slots(),
+            archetype_edge_capacity: archetypes.audit_edge_capacity(),
+            archetype_retained_bytes,
+            table_count: storages.tables.len(),
+            empty_table_count: storages.tables.audit_empty_count(),
+            table_entity_count: storages.tables.audit_entity_count(),
+            table_entity_capacity: storages.tables.audit_entity_capacity(),
+            table_entity_retained_bytes,
+            table_column_count: storages.tables.audit_column_count(),
+            table_column_retained_bytes,
+            sparse_set_count: storages.sparse_sets.len(),
+            sparse_set_entity_count: storages.sparse_sets.audit_entity_count(),
+            sparse_set_entity_capacity: storages.sparse_sets.audit_entity_capacity(),
+            sparse_set_sparse_slots: storages.sparse_sets.audit_sparse_slot_count(),
+            sparse_set_sparse_capacity: storages.sparse_sets.audit_sparse_slot_capacity(),
+            sparse_set_retained_bytes,
+            command_queue_len_bytes,
+            command_queue_capacity_bytes,
+            command_queue_panic_recovery_len_bytes,
+            command_queue_panic_recovery_capacity_bytes,
+            observer_event_cache_entries: world.observers().audit_event_cache_entries(),
+            observer_event_cache_capacity: world.observers().audit_event_cache_capacity(),
+            observer_runner_entries: world.observers().audit_runner_entries(),
+            observer_runner_capacity: world.observers().audit_runner_capacity(),
+            observer_retained_bytes,
         }
     }
 
@@ -629,20 +733,24 @@ pub(crate) use imp::*;
 
 #[cfg(feature = "bevy_ecs_audit")]
 pub use imp::{
-    force_check_change_ticks, reset, snapshot, storage_metrics, AuditCounters, StorageMetrics,
+    force_check_change_ticks, memory_metrics, reset, snapshot, storage_metrics, AuditCounters,
+    MemoryMetrics, StorageMetrics,
 };
 
 #[cfg(all(test, feature = "bevy_ecs_audit"))]
 mod tests {
     use crate::{
         component::Component,
+        entity::{Entity, EntityIndex},
         event::Event,
+        hierarchy::ChildOf,
         observer::On,
         prelude::Resource,
         schedule::{ApplyDeferred, IntoScheduleConfigs, MultiThreadedExecutor, Schedule},
         system::{Commands, ResMut},
         world::{CommandQueue, World},
     };
+    use std::eprintln;
 
     #[derive(Component)]
     struct TableComponent;
@@ -663,6 +771,36 @@ mod tests {
     #[derive(Resource, Default)]
     struct AuditScheduleLog(usize);
 
+    #[derive(Component)]
+    struct MemoryDense;
+
+    #[derive(Component)]
+    #[component(storage = "SparseSet")]
+    struct MemorySparse;
+
+    #[repr(align(256))]
+    #[derive(Component)]
+    struct MemoryAligned {
+        _bytes: [u8; 64],
+    }
+
+    #[derive(Event)]
+    struct MemoryEvent;
+
+    macro_rules! marker_components {
+        ($($name:ident),* $(,)?) => {
+            $(
+                #[derive(Component)]
+                struct $name;
+            )*
+        };
+    }
+
+    marker_components!(
+        M0, M1, M2, M3, M4, M5, M6, M7, M8, M9, M10, M11, M12, M13, M14, M15, M16, M17, M18, M19,
+        M20, M21, M22, M23, M24, M25, M26, M27, M28, M29, M30, M31,
+    );
+
     fn audit_schedule_command(mut commands: Commands) {
         commands.queue(|world: &mut World| {
             world.resource_mut::<AuditScheduleLog>().0 += 1;
@@ -671,6 +809,197 @@ mod tests {
 
     fn audit_schedule_system(mut log: ResMut<AuditScheduleLog>) {
         log.0 += 1;
+    }
+
+    fn audit_noop_system() {}
+
+    macro_rules! insert_markers {
+        ($entity:ident, $mask:ident, $($bit:literal => $component:ident),* $(,)?) => {
+            $(
+                if $mask & (1usize << $bit) != 0 {
+                    $entity.insert($component);
+                }
+            )*
+        };
+    }
+
+    fn insert_archetype_churn_components(world: &mut World, entity: Entity, mask: usize) {
+        let mut entity = world.entity_mut(entity);
+        insert_markers!(
+            entity, mask,
+            0 => M0, 1 => M1, 2 => M2, 3 => M3, 4 => M4, 5 => M5, 6 => M6, 7 => M7,
+            8 => M8, 9 => M9, 10 => M10, 11 => M11, 12 => M12, 13 => M13, 14 => M14,
+            15 => M15, 16 => M16,
+        );
+    }
+
+    fn insert_wide_components(world: &mut World, entity: Entity) {
+        let mut entity = world.entity_mut(entity);
+        entity
+            .insert(M0)
+            .insert(M1)
+            .insert(M2)
+            .insert(M3)
+            .insert(M4)
+            .insert(M5)
+            .insert(M6)
+            .insert(M7)
+            .insert(M8)
+            .insert(M9)
+            .insert(M10)
+            .insert(M11)
+            .insert(M12)
+            .insert(M13)
+            .insert(M14)
+            .insert(M15)
+            .insert(M16)
+            .insert(M17)
+            .insert(M18)
+            .insert(M19)
+            .insert(M20)
+            .insert(M21)
+            .insert(M22)
+            .insert(M23)
+            .insert(M24)
+            .insert(M25)
+            .insert(M26)
+            .insert(M27)
+            .insert(M28)
+            .insert(M29)
+            .insert(M30)
+            .insert(M31);
+    }
+
+    fn metric_report(label: &str, metrics: super::MemoryMetrics) {
+        eprintln!(
+            "memory_audit label={label} estimated_retained_bytes={} entity_meta_bytes={} archetype_bytes={} table_entity_bytes={} table_column_bytes={} sparse_bytes={} command_queue_capacity_bytes={} observer_bytes={} archetypes={} empty_archetypes={} tables={} empty_tables={} table_entity_capacity={} sparse_slots={} sparse_slot_capacity={} observer_cache_capacity={} observer_runner_capacity={}",
+            metrics.estimated_retained_bytes,
+            metrics.entity_meta_retained_bytes,
+            metrics.archetype_retained_bytes,
+            metrics.table_entity_retained_bytes,
+            metrics.table_column_retained_bytes,
+            metrics.sparse_set_retained_bytes,
+            metrics.command_queue_capacity_bytes
+                + metrics.command_queue_panic_recovery_capacity_bytes,
+            metrics.observer_retained_bytes,
+            metrics.archetype_count,
+            metrics.empty_archetype_count,
+            metrics.table_count,
+            metrics.empty_table_count,
+            metrics.table_entity_capacity,
+            metrics.sparse_set_sparse_slots,
+            metrics.sparse_set_sparse_capacity,
+            metrics.observer_event_cache_capacity,
+            metrics.observer_runner_capacity,
+        );
+    }
+
+    fn spawn_despawn_entities(entity_count: usize) -> super::MemoryMetrics {
+        let mut world = World::new();
+        world.spawn_batch((0..entity_count).map(|_| MemoryDense));
+        world.clear_entities();
+        super::memory_metrics(&world)
+    }
+
+    fn archetype_churn(archetype_count: usize) -> super::MemoryMetrics {
+        let mut world = World::new();
+        for mask in 0..archetype_count {
+            let entity = world.spawn_empty().id();
+            insert_archetype_churn_components(&mut world, entity, mask);
+        }
+        world.clear_entities();
+        super::memory_metrics(&world)
+    }
+
+    fn sparse_high_index(
+        high_start: u32,
+        sparse_entities: u32,
+        stride: u32,
+    ) -> super::MemoryMetrics {
+        let mut world = World::new();
+        for offset in 0..sparse_entities {
+            let entity = Entity::from_index(
+                EntityIndex::from_raw_u32(high_start + offset.saturating_mul(stride)).unwrap(),
+            );
+            world.spawn_empty_at(entity).unwrap();
+            world.entity_mut(entity).insert(MemorySparse);
+        }
+        world.clear_entities();
+        super::memory_metrics(&world)
+    }
+
+    fn command_storm(command_count: usize) -> super::MemoryMetrics {
+        let mut world = World::new();
+        for _ in 0..command_count {
+            world.commands().queue(|world: &mut World| {
+                world.spawn(MemoryDense);
+            });
+        }
+        world.flush();
+        world.clear_entities();
+        super::memory_metrics(&world)
+    }
+
+    fn observer_storm(observer_count: usize) -> super::MemoryMetrics {
+        let mut world = World::new();
+        let observers = (0..observer_count)
+            .map(|_| world.add_observer(|_: On<MemoryEvent>| {}).id())
+            .collect::<alloc::vec::Vec<_>>();
+        for observer in observers {
+            world.despawn(observer);
+        }
+        super::memory_metrics(&world)
+    }
+
+    fn relationship_storm(child_count: usize) -> super::MemoryMetrics {
+        let mut world = World::new();
+        let parent = world.spawn_empty().id();
+        let children = (0..child_count)
+            .map(|_| world.spawn_empty().id())
+            .collect::<alloc::vec::Vec<_>>();
+        world.entity_mut(parent).add_children(&children);
+        assert_eq!(world.query::<&ChildOf>().iter(&world).count(), child_count);
+        world.entity_mut(parent).detach_children(&children);
+        world.clear_entities();
+        super::memory_metrics(&world)
+    }
+
+    fn schedule_rebuild_storm(
+        rebuild_count: usize,
+        systems_per_schedule: usize,
+    ) -> super::MemoryMetrics {
+        let mut world = World::new();
+        for _ in 0..rebuild_count {
+            let mut schedule = Schedule::default();
+            for _ in 0..systems_per_schedule {
+                schedule.add_systems(audit_noop_system);
+            }
+            schedule.run(&mut world);
+        }
+        super::memory_metrics(&world)
+    }
+
+    fn aligned_table_churn(entity_count: usize) -> super::MemoryMetrics {
+        let mut world = World::new();
+        world.spawn_batch((0..entity_count).map(|_| MemoryAligned { _bytes: [0; 64] }));
+        world.clear_entities();
+        super::memory_metrics(&world)
+    }
+
+    fn wide_table_removal(entity_count: usize) -> super::MemoryMetrics {
+        let mut world = World::new();
+        let entities = (0..entity_count)
+            .map(|_| {
+                let entity = world.spawn_empty().id();
+                insert_wide_components(&mut world, entity);
+                entity
+            })
+            .collect::<alloc::vec::Vec<_>>();
+        for entity in entities {
+            world.entity_mut(entity).remove::<M15>();
+        }
+        world.clear_entities();
+        super::memory_metrics(&world)
     }
 
     #[test]
@@ -746,5 +1075,53 @@ mod tests {
         assert!(counters.change_tick_check_sparse_sets > 0);
         assert!(counters.change_tick_check_empty_sparse_sets > 0);
         assert!(counters.change_tick_check_component_ticks > 0);
+    }
+
+    #[test]
+    fn memory_metrics_record_representative_retained_capacity() {
+        let entity_metrics = spawn_despawn_entities(1_024);
+        assert_eq!(entity_metrics.table_entity_count, 0);
+        assert!(entity_metrics.entity_meta_capacity >= 1_024);
+        assert!(entity_metrics.table_column_retained_bytes > 0);
+
+        let sparse_metrics = sparse_high_index(20_000, 4, 1_000);
+        assert_eq!(sparse_metrics.sparse_set_entity_count, 0);
+        assert!(
+            sparse_metrics.sparse_set_sparse_capacity >= 23_001,
+            "sparse capacity should retain the high entity-index backing array"
+        );
+
+        let command_metrics = command_storm(512);
+        assert!(command_metrics.command_queue_capacity_bytes > 0);
+        assert!(command_metrics.estimated_retained_bytes > 0);
+    }
+
+    #[test]
+    #[ignore = "heavy memory audit scenario; run explicitly with --ignored --nocapture"]
+    fn memory_audit_heavy_churn_scenarios() {
+        macro_rules! run_scenario {
+            ($label:literal, $metrics:expr) => {{
+                let label = $label;
+                let metrics = $metrics;
+                metric_report(label, metrics);
+                assert!(
+                    metrics.estimated_retained_bytes > 0 || label == "schedule_rebuild_storm",
+                    "retained bytes should be visible for {label}"
+                );
+            }};
+        }
+
+        run_scenario!("spawn_despawn_1m", spawn_despawn_entities(1_000_000));
+        run_scenario!("archetype_churn_100k", archetype_churn(100_000));
+        run_scenario!(
+            "sparse_high_index_low_density",
+            sparse_high_index(10_000_000, 100, 10_000)
+        );
+        run_scenario!("command_storm_repeated", command_storm(100_000));
+        run_scenario!("observer_register_unregister_storm", observer_storm(10_000));
+        run_scenario!("relationship_add_remove_storm", relationship_storm(100_000));
+        run_scenario!("schedule_rebuild_storm", schedule_rebuild_storm(1_000, 64));
+        run_scenario!("large_alignment_table_churn", aligned_table_churn(100_000));
+        run_scenario!("wide_table_component_removal", wide_table_removal(10_000));
     }
 }

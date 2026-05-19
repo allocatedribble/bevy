@@ -9,6 +9,8 @@ use alloc::{boxed::Box, vec, vec::Vec};
 use bevy_platform::collections::HashMap;
 use bevy_ptr::{OwningPtr, Ptr, UnsafeCellDeref};
 pub use column::*;
+#[cfg(feature = "bevy_ecs_audit")]
+use core::mem::size_of;
 use core::{
     cell::UnsafeCell,
     num::NonZeroUsize,
@@ -216,6 +218,20 @@ impl Table {
     #[inline]
     pub fn capacity(&self) -> usize {
         self.entities.capacity()
+    }
+
+    #[cfg(feature = "bevy_ecs_audit")]
+    pub(crate) fn audit_entity_retained_bytes(&self) -> usize {
+        self.entities.capacity().saturating_mul(size_of::<Entity>())
+    }
+
+    #[cfg(feature = "bevy_ecs_audit")]
+    pub(crate) fn audit_column_retained_bytes(&self) -> usize {
+        let capacity = self.capacity();
+        self.columns
+            .values()
+            .map(|column| column.audit_retained_bytes(capacity))
+            .sum()
     }
 
     /// Removes the entity at the given row and returns the entity swapped in to replace it (if an
@@ -748,6 +764,22 @@ impl Tables {
     #[cfg(any(test, feature = "bevy_ecs_audit"))]
     pub(crate) fn audit_column_count(&self) -> usize {
         self.tables.iter().map(Table::component_count).sum()
+    }
+
+    #[cfg(feature = "bevy_ecs_audit")]
+    pub(crate) fn audit_entity_retained_bytes(&self) -> usize {
+        self.tables
+            .iter()
+            .map(Table::audit_entity_retained_bytes)
+            .sum()
+    }
+
+    #[cfg(feature = "bevy_ecs_audit")]
+    pub(crate) fn audit_column_retained_bytes(&self) -> usize {
+        self.tables
+            .iter()
+            .map(Table::audit_column_retained_bytes)
+            .sum()
     }
 
     /// Moves the `row` column values from `old_table_id` to a new row in `new_table_id`,
