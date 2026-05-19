@@ -41,6 +41,7 @@ Claim: table-heavy dense iteration is already strong, but sparse optional fetche
 
 Current evidence:
 
+- Pass 2 follow-up added a deterministic slow-oracle regression for normal sparse optional, sparse `Has`, `AnyOf`, and `With`/`Without` query shapes under component/despawn churn.
 - Pass 1 benchmarks show optional sparse query cost rises with density:
   - 1 percent: `18.209 us .. 20.022 us`
   - 90 percent: `46.384 us .. 47.423 us`
@@ -51,8 +52,8 @@ Current evidence:
 
 Evidence gap:
 
-- No Pass 2 query oracle audit is present in the current branch history.
-- There is no broad slow-oracle differential test suite for sparse optionals, `Has<Sparse>`, dynamic query transmutation, manual query-state update, and non-archetypal filters.
+- Pass 2 now has a seed oracle, but not the full matrix.
+- There is no broad slow-oracle differential test suite yet for dynamic `QueryBuilder`, query transmutation, manual query-state update, `QueryLens`, `FilteredEntityRef`, and non-archetypal filters.
 
 Falsification test:
 
@@ -62,7 +63,7 @@ Falsification test:
 
 Next patch target:
 
-- Fill the missing Pass 2 artifact: oracle tests, sparse optional regression, query planner benchmarks, and an explicit "planner admitted or rejected" table.
+- Expand the Pass 2 oracle matrix and add an explicit "planner admitted or rejected" table before any query planner change.
 
 ## H3: Archetype Churn Needs Telemetry Before Redesign
 

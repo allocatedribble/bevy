@@ -1924,9 +1924,11 @@ mod tests {
         component::Component,
         entity_disabling::DefaultQueryFilters,
         prelude::*,
+        query::QueryFilter,
         system::{QueryLens, RunSystemOnce},
         world::{EntityRef, FilteredEntityMut, FilteredEntityRef},
     };
+    use alloc::vec::Vec;
 
     #[test]
     #[should_panic]
@@ -2425,6 +2427,162 @@ mod tests {
 
     #[derive(Component)]
     struct Dummy;
+
+    #[derive(Component, Debug, Clone, Copy, PartialEq, Eq)]
+    struct OracleTableA(u32);
+
+    #[derive(Component, Debug, Clone, Copy, PartialEq, Eq)]
+    struct OracleTableB(u32);
+
+    #[derive(Component, Debug, Clone, Copy, PartialEq, Eq)]
+    #[component(storage = "SparseSet")]
+    struct OracleSparseA(u32);
+
+    #[derive(Component, Debug, Clone, Copy, PartialEq, Eq)]
+    #[component(storage = "SparseSet")]
+    struct OracleSparseB(u32);
+
+    fn oracle_entities(
+        world: &World,
+        mut predicate: impl FnMut(&World, Entity) -> bool,
+    ) -> Vec<Entity> {
+        let mut entities = world
+            .iter_entities()
+            .map(|entity| entity.id())
+            .filter(|&entity| predicate(world, entity))
+            .collect::<Vec<_>>();
+        entities.sort();
+        entities
+    }
+
+    fn sorted_query_entities<F>(world: &World, query: &mut QueryState<Entity, F>) -> Vec<Entity>
+    where
+        F: QueryFilter,
+    {
+        let mut entities = query.iter(world).collect::<Vec<_>>();
+        entities.sort();
+        entities
+    }
+
+    #[test]
+    fn slow_oracle_matches_sparse_optional_has_anyof_and_filters() {
+        let mut world = World::new();
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = || {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            state
+        };
+
+        let entities = (0..256)
+            .map(|i| {
+                let bits = next();
+                let entity = world.spawn_empty().id();
+                let mut entity_mut = world.entity_mut(entity);
+                if bits & 1 != 0 {
+                    entity_mut.insert(OracleTableA(i));
+                }
+                if bits & 2 != 0 {
+                    entity_mut.insert(OracleTableB(i.wrapping_mul(3)));
+                }
+                if bits & 4 != 0 {
+                    entity_mut.insert(OracleSparseA(i.wrapping_add(11)));
+                }
+                if bits & 8 != 0 {
+                    entity_mut.insert(OracleSparseB(i.wrapping_add(29)));
+                }
+                entity
+            })
+            .collect::<Vec<_>>();
+
+        for (i, entity) in entities.iter().copied().enumerate() {
+            if world.get_entity(entity).is_err() {
+                continue;
+            }
+
+            let bits = next();
+            if bits % 17 == 0 {
+                world.despawn(entity);
+                continue;
+            }
+
+            let mut entity_mut = world.entity_mut(entity);
+            if bits & 0x10 != 0 {
+                entity_mut.insert(OracleTableA((i as u32).wrapping_mul(5)));
+            }
+            if bits & 0x20 != 0 {
+                entity_mut.remove::<OracleTableB>();
+            }
+            if bits & 0x40 != 0 {
+                entity_mut.insert(OracleSparseA((i as u32).wrapping_mul(7)));
+            }
+            if bits & 0x80 != 0 {
+                entity_mut.remove::<OracleSparseB>();
+            }
+        }
+
+        let expected_table_with_sparse_optional = oracle_entities(&world, |world, entity| {
+            world.get::<OracleTableA>(entity).is_some()
+        });
+        let mut query = world.query::<(Entity, &OracleTableA, Option<&OracleSparseA>)>();
+        let mut actual_table_with_sparse_optional = query
+            .iter(&world)
+            .map(|(entity, table, sparse)| {
+                let expected_table = world.get::<OracleTableA>(entity).unwrap();
+                let expected_sparse = world.get::<OracleSparseA>(entity);
+                assert_eq!(table, expected_table);
+                assert_eq!(sparse, expected_sparse);
+                entity
+            })
+            .collect::<Vec<_>>();
+        actual_table_with_sparse_optional.sort();
+        assert_eq!(
+            actual_table_with_sparse_optional,
+            expected_table_with_sparse_optional
+        );
+
+        let expected_has_sparse = oracle_entities(&world, |world, entity| {
+            world.get::<OracleTableA>(entity).is_some()
+        });
+        let mut query = world.query_filtered::<(Entity, Has<OracleSparseA>), With<OracleTableA>>();
+        let mut actual_has_sparse = query
+            .iter(&world)
+            .map(|(entity, has_sparse)| {
+                assert_eq!(has_sparse, world.get::<OracleSparseA>(entity).is_some());
+                entity
+            })
+            .collect::<Vec<_>>();
+        actual_has_sparse.sort();
+        assert_eq!(actual_has_sparse, expected_has_sparse);
+
+        let expected_any_of = oracle_entities(&world, |world, entity| {
+            world.get::<OracleTableA>(entity).is_some()
+                || world.get::<OracleSparseA>(entity).is_some()
+        });
+        let mut query = world.query::<(Entity, AnyOf<(&OracleTableA, &OracleSparseA)>)>();
+        let mut actual_any_of = query
+            .iter(&world)
+            .map(|(entity, any_of)| {
+                assert_eq!(any_of.0, world.get::<OracleTableA>(entity));
+                assert_eq!(any_of.1, world.get::<OracleSparseA>(entity));
+                entity
+            })
+            .collect::<Vec<_>>();
+        actual_any_of.sort();
+        assert_eq!(actual_any_of, expected_any_of);
+
+        let expected_with_without = oracle_entities(&world, |world, entity| {
+            world.get::<OracleTableA>(entity).is_some()
+                && world.get::<OracleSparseB>(entity).is_none()
+        });
+        let mut query =
+            QueryState::<Entity, (With<OracleTableA>, Without<OracleSparseB>)>::new(&mut world);
+        assert_eq!(
+            sorted_query_entities(&world, &mut query),
+            expected_with_without
+        );
+    }
 
     #[test]
     fn query_default_filters_updates_is_dense() {
