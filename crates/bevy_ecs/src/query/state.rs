@@ -1924,7 +1924,7 @@ mod tests {
         component::Component,
         entity_disabling::DefaultQueryFilters,
         prelude::*,
-        query::QueryFilter,
+        query::{QueryBuilder, QueryFilter},
         system::{QueryLens, RunSystemOnce},
         world::{EntityRef, FilteredEntityMut, FilteredEntityRef},
     };
@@ -2464,8 +2464,7 @@ mod tests {
         entities
     }
 
-    #[test]
-    fn slow_oracle_matches_sparse_optional_has_anyof_and_filters() {
+    fn oracle_world_with_component_churn() -> World {
         let mut world = World::new();
         let mut state = 0x9e37_79b9_7f4a_7c15u64;
         let mut next = || {
@@ -2521,6 +2520,39 @@ mod tests {
                 entity_mut.remove::<OracleSparseB>();
             }
         }
+
+        world
+    }
+
+    fn oracle_table_with_sparse_a_flags(world: &World) -> Vec<(Entity, bool)> {
+        let mut entities = world
+            .iter_entities()
+            .map(|entity| entity.id())
+            .filter_map(|entity| {
+                world
+                    .get::<OracleTableA>(entity)
+                    .map(|_| (entity, world.get::<OracleSparseA>(entity).is_some()))
+            })
+            .collect::<Vec<_>>();
+        entities.sort();
+        entities
+    }
+
+    fn sorted_filtered_entities<F: QueryFilter>(world: &mut World) -> Vec<Entity> {
+        let mut query = world.query_filtered::<Entity, F>();
+        let mut entities = query.iter(world).collect::<Vec<_>>();
+        entities.sort();
+        entities
+    }
+
+    fn sorted_entities(mut entities: Vec<Entity>) -> Vec<Entity> {
+        entities.sort();
+        entities
+    }
+
+    #[test]
+    fn slow_oracle_matches_sparse_optional_has_anyof_and_filters() {
+        let mut world = oracle_world_with_component_churn();
 
         let expected_table_with_sparse_optional = oracle_entities(&world, |world, entity| {
             world.get::<OracleTableA>(entity).is_some()
@@ -2581,6 +2613,221 @@ mod tests {
         assert_eq!(
             sorted_query_entities(&world, &mut query),
             expected_with_without
+        );
+    }
+
+    #[test]
+    fn query_builder_filtered_entity_ref_matches_dynamic_oracle() {
+        let mut world = oracle_world_with_component_churn();
+        let table_a = world.register_component::<OracleTableA>();
+        let sparse_a = world.register_component::<OracleSparseA>();
+        let sparse_b = world.register_component::<OracleSparseB>();
+        let expected = oracle_entities(&world, |world, entity| {
+            world.get::<OracleTableA>(entity).is_some()
+                && world.get::<OracleSparseB>(entity).is_none()
+        });
+
+        let mut query = QueryBuilder::<FilteredEntityRef>::new(&mut world)
+            .ref_id(table_a)
+            .optional(|builder| {
+                builder.ref_id(sparse_a);
+            })
+            .without_id(sparse_b)
+            .build();
+
+        let mut actual = query
+            .iter(&world)
+            .map(|entity_ref| {
+                let entity = entity_ref.id();
+                let table = entity_ref.get_by_id(table_a).unwrap();
+                // SAFETY: `table_a` was registered for `OracleTableA`, and `ref_id(table_a)`
+                // gives this `FilteredEntityRef` read access to the component.
+                unsafe {
+                    assert_eq!(
+                        table.deref::<OracleTableA>(),
+                        world.get::<OracleTableA>(entity).unwrap()
+                    );
+                }
+                assert_eq!(
+                    entity_ref.get_by_id(sparse_a).is_some(),
+                    world.get::<OracleSparseA>(entity).is_some()
+                );
+                assert!(entity_ref.get_by_id(sparse_b).is_none());
+                entity
+            })
+            .collect::<Vec<_>>();
+        actual.sort();
+
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn manual_query_update_archetypes_matches_oracle_after_new_archetype() {
+        let mut world = oracle_world_with_component_churn();
+        let mut query =
+            QueryState::<(Entity, &OracleTableA, Option<&OracleSparseA>)>::new(&mut world);
+        query.update_archetypes(&world);
+
+        let late_entity = world
+            .spawn((OracleTableA(999), OracleSparseA(1000), Dummy))
+            .id();
+        let before_update = query
+            .iter_manual(&world)
+            .map(|(entity, _, _)| entity)
+            .collect::<Vec<_>>();
+        assert!(
+            !before_update.contains(&late_entity),
+            "manual iteration must not see a new archetype before update_archetypes"
+        );
+
+        query.update_archetypes(&world);
+        let mut actual = query
+            .iter_manual(&world)
+            .map(|(entity, table, sparse)| {
+                assert_eq!(table, world.get::<OracleTableA>(entity).unwrap());
+                assert_eq!(sparse, world.get::<OracleSparseA>(entity));
+                entity
+            })
+            .collect::<Vec<_>>();
+        actual.sort();
+
+        assert_eq!(
+            actual,
+            oracle_entities(&world, |world, entity| {
+                world.get::<OracleTableA>(entity).is_some()
+            })
+        );
+    }
+
+    #[test]
+    fn transmute_and_filtered_entity_ref_match_sparse_oracle() {
+        let mut world = oracle_world_with_component_churn();
+        let expected = oracle_table_with_sparse_a_flags(&world);
+
+        let query = QueryState::<(Entity, &OracleTableA, Option<&OracleSparseA>)>::new(&mut world);
+        let mut transmuted = query.transmute::<(Entity, Has<OracleSparseA>)>(&world);
+        let mut actual = transmuted
+            .iter(&world)
+            .map(|(entity, has_sparse)| (entity, has_sparse))
+            .collect::<Vec<_>>();
+        actual.sort();
+        assert_eq!(actual, expected);
+
+        let query = QueryState::<(Entity, &OracleTableA, Option<&OracleSparseA>)>::new(&mut world);
+        let mut transmuted = query.transmute::<(Entity, FilteredEntityRef)>(&world);
+        let mut actual = transmuted
+            .iter(&world)
+            .map(|(entity, entity_ref)| {
+                assert_eq!(entity_ref.id(), entity);
+                assert_eq!(
+                    entity_ref.get::<OracleTableA>(),
+                    world.get::<OracleTableA>(entity)
+                );
+                assert_eq!(
+                    entity_ref.get::<OracleSparseA>(),
+                    world.get::<OracleSparseA>(entity)
+                );
+                assert!(entity_ref.get::<OracleSparseB>().is_none());
+                (entity, entity_ref.get::<OracleSparseA>().is_some())
+            })
+            .collect::<Vec<_>>();
+        actual.sort();
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn query_lens_matches_sparse_has_oracle() {
+        let mut world = oracle_world_with_component_churn();
+        let expected = oracle_table_with_sparse_a_flags(&world);
+        let mut actual = world
+            .run_system_once(
+                |mut query: Query<(Entity, &OracleTableA, Option<&OracleSparseA>)>| {
+                    let mut lens: QueryLens<(Entity, Has<OracleSparseA>)> = query.transmute_lens();
+                    let query = lens.query();
+                    let mut entities = query
+                        .iter()
+                        .map(|(entity, has_sparse)| (entity, has_sparse))
+                        .collect::<Vec<_>>();
+                    entities.sort();
+                    entities
+                },
+            )
+            .unwrap();
+        actual.sort();
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn added_changed_filters_match_table_and_sparse_oracle() {
+        let mut world = World::new();
+        let table_changed = world.spawn((OracleTableA(0), OracleSparseB(0))).id();
+        let sparse_changed = world.spawn(OracleSparseA(1)).id();
+        let sparse_added = world.spawn(OracleTableB(2)).id();
+
+        world.clear_trackers();
+
+        world
+            .entity_mut(table_changed)
+            .get_mut::<OracleTableA>()
+            .unwrap()
+            .0 = 10;
+        world
+            .entity_mut(sparse_changed)
+            .get_mut::<OracleSparseA>()
+            .unwrap()
+            .0 = 11;
+        world.entity_mut(sparse_added).insert(OracleSparseA(12));
+        let added_both = world.spawn((OracleTableA(13), OracleSparseA(14))).id();
+
+        assert_eq!(
+            sorted_filtered_entities::<Added<OracleTableA>>(&mut world),
+            sorted_entities(Vec::from([added_both]))
+        );
+        assert_eq!(
+            sorted_filtered_entities::<Changed<OracleTableA>>(&mut world),
+            sorted_entities(Vec::from([table_changed, added_both]))
+        );
+        assert_eq!(
+            sorted_filtered_entities::<Added<OracleSparseA>>(&mut world),
+            sorted_entities(Vec::from([sparse_added, added_both]))
+        );
+        assert_eq!(
+            sorted_filtered_entities::<Changed<OracleSparseA>>(&mut world),
+            sorted_entities(Vec::from([sparse_changed, sparse_added, added_both]))
+        );
+    }
+
+    #[test]
+    fn dense_transmuted_sparse_option_and_has_current_behavior_is_oracle_mismatch() {
+        let mut world = World::new();
+        let sparse_entity = world.spawn(OracleSparseA(1)).id();
+        let expected = oracle_entities(&world, |world, entity| {
+            world.get::<OracleSparseA>(entity).is_some()
+        });
+        assert_eq!(expected, Vec::from([sparse_entity]));
+
+        let mut option_query = QueryState::<EntityRef>::new(&mut world)
+            .transmute::<(Entity, Option<&OracleSparseA>)>(&world);
+        assert!(option_query.is_dense);
+        let actual = option_query
+            .iter(&world)
+            .filter_map(|(entity, sparse)| sparse.map(|_| entity))
+            .collect::<Vec<_>>();
+        assert!(
+            actual.is_empty(),
+            "current dense-transmuted Option<&Sparse> behavior is documented as an oracle mismatch"
+        );
+
+        let mut has_query = QueryState::<EntityRef>::new(&mut world)
+            .transmute::<(Entity, Has<OracleSparseA>)>(&world);
+        assert!(has_query.is_dense);
+        let actual = has_query
+            .iter(&world)
+            .filter_map(|(entity, has_sparse)| has_sparse.then_some(entity))
+            .collect::<Vec<_>>();
+        assert!(
+            actual.is_empty(),
+            "current dense-transmuted Has<Sparse> behavior is documented as an oracle mismatch"
         );
     }
 

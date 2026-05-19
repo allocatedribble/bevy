@@ -35,13 +35,13 @@ Next patch target:
 
 ## H2: Query Performance Cliffs Are Shape-Dependent
 
-Status: `open`
+Status: `partially_confirmed`
 
 Claim: table-heavy dense iteration is already strong, but sparse optional fetches, `Has<Sparse>`, and change filters are more fragile. A planner could beat one-size iteration for selected shapes.
 
 Current evidence:
 
-- Pass 2 follow-up added a deterministic slow-oracle regression for normal sparse optional, sparse `Has`, `AnyOf`, and `With`/`Without` query shapes under component/despawn churn.
+- Pass 2 follow-up added deterministic slow-oracle regressions for normal sparse optional, sparse `Has`, `AnyOf`, `With`/`Without`, dynamic `QueryBuilder`, manual `QueryState::update_archetypes`, `QueryState::transmute`, `QueryLens`, `FilteredEntityRef`, and `Added<T>`/`Changed<T>` query shapes under component/despawn churn.
 - Pass 1 benchmarks show optional sparse query cost rises with density:
   - 1 percent: `18.209 us .. 20.022 us`
   - 90 percent: `46.384 us .. 47.423 us`
@@ -52,8 +52,8 @@ Current evidence:
 
 Evidence gap:
 
-- Pass 2 now has a seed oracle, but not the full matrix.
-- There is no broad slow-oracle differential test suite yet for dynamic `QueryBuilder`, query transmutation, manual query-state update, `QueryLens`, `FilteredEntityRef`, and non-archetypal filters.
+- The listed Pass 2 correctness gaps are now covered by deterministic oracles.
+- There is not yet a broad randomized matrix or a query planner benchmark gate for sparse-driving iteration and sparse optional density.
 
 Falsification test:
 
@@ -63,7 +63,7 @@ Falsification test:
 
 Next patch target:
 
-- Expand the Pass 2 oracle matrix and add an explicit "planner admitted or rejected" table before any query planner change.
+- Add the query planner benchmark gate and an explicit "planner admitted or rejected" table before any query planner change.
 
 ## H3: Archetype Churn Needs Telemetry Before Redesign
 
