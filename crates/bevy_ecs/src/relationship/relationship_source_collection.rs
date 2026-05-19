@@ -11,6 +11,17 @@ use smallvec::SmallVec;
 
 /// The internal [`Entity`] collection used by a [`RelationshipTarget`](crate::relationship::RelationshipTarget) component.
 /// This is not intended to be modified directly by users, as it could invalidate the correctness of relationships.
+///
+/// # Collection choice
+///
+/// [`Vec<Entity>`] is compact and preserves insertion order, making it a good default for small ordered
+/// relationship sets like [`Children`](crate::hierarchy::Children). Its removal path scans for the entity
+/// and then shifts the tail, so removing the first source from a very large collection is the expensive case.
+///
+/// [`SmallVec<[Entity; N]>`](SmallVec) keeps tiny relationship sets inline, but still has linear removal
+/// behavior once the source is found. [`EntityHashSet`] gives unordered uniqueness with faster large-set
+/// removals, while [`EntityIndexSet`] preserves insertion order and uniqueness with index-set removal costs.
+/// Prefer set-backed collections when large fan-out and arbitrary removals dominate iteration order.
 pub trait RelationshipSourceCollection {
     /// The type of iterator returned by the `iter` method.
     ///

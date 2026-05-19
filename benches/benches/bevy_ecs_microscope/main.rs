@@ -1,7 +1,9 @@
 use bevy_ecs::{
+    entity::{EntityHashSet, EntityIndexSet},
     event::EntityComponentsTrigger,
-    hierarchy::ChildOf,
+    hierarchy::{ChildOf, Children},
     prelude::*,
+    relationship::Relationship,
     schedule::{
         ApplyDeferred, MultiThreadedExecutor, Schedule, ScheduleBuildSettings,
         SingleThreadedExecutor,
@@ -11,6 +13,7 @@ use bevy_ecs::{
 };
 use core::hint::black_box;
 use criterion::{criterion_group, criterion_main, BatchSize, BenchmarkId, Criterion};
+use smallvec::SmallVec;
 
 #[derive(Component)]
 struct A0;
@@ -80,6 +83,38 @@ struct MicroscopeEntityComponentsEvent(Entity);
 
 #[derive(Component)]
 struct TransitionMarker;
+
+#[derive(Component)]
+#[relationship(relationship_target = VecRelSources)]
+struct VecRel(Entity);
+
+#[derive(Component)]
+#[relationship_target(relationship = VecRel)]
+struct VecRelSources(Vec<Entity>);
+
+#[derive(Component)]
+#[relationship(relationship_target = SmallVecRelSources)]
+struct SmallVecRel(Entity);
+
+#[derive(Component)]
+#[relationship_target(relationship = SmallVecRel)]
+struct SmallVecRelSources(SmallVec<[Entity; 8]>);
+
+#[derive(Component)]
+#[relationship(relationship_target = HashSetRelSources)]
+struct HashSetRel(Entity);
+
+#[derive(Component)]
+#[relationship_target(relationship = HashSetRel)]
+struct HashSetRelSources(EntityHashSet);
+
+#[derive(Component)]
+#[relationship(relationship_target = IndexSetRelSources)]
+struct IndexSetRel(Entity);
+
+#[derive(Component)]
+#[relationship_target(relationship = IndexSetRel)]
+struct IndexSetRelSources(EntityIndexSet);
 
 macro_rules! wide_components {
     ($($name:ident),* $(,)?) => {
@@ -1457,6 +1492,230 @@ fn observer_and_relationship_storms(c: &mut Criterion) {
     group.finish();
 }
 
+fn spawn_child_chain(world: &mut World, depth: usize) -> (Entity, Entity) {
+    let root = world.spawn_empty().id();
+    let mut leaf = root;
+    for _ in 0..depth {
+        leaf = world.spawn(ChildOf(leaf)).id();
+    }
+    (root, leaf)
+}
+
+fn spawn_children(world: &mut World, parent: Entity, child_count: usize) -> Vec<Entity> {
+    (0..child_count)
+        .map(|_| world.spawn(ChildOf(parent)).id())
+        .collect()
+}
+
+fn relationship_hierarchy_pressure(c: &mut Criterion) {
+    let mut group = c.benchmark_group("ecs_microscope/relationship_hierarchy");
+    group.warm_up_time(core::time::Duration::from_millis(150));
+    group.measurement_time(core::time::Duration::from_secs(1));
+    group.sample_size(10);
+
+    for child_count in [10, 100, 1_000, 10_000, 100_000] {
+        group.bench_with_input(
+            BenchmarkId::new("add_children_vec", child_count),
+            &child_count,
+            |bencher, &child_count| {
+                bencher.iter_batched(
+                    || {
+                        let mut world = World::new();
+                        let parent = world.spawn_empty().id();
+                        let children = (0..child_count)
+                            .map(|_| world.spawn_empty().id())
+                            .collect::<Vec<_>>();
+                        (world, parent, children)
+                    },
+                    |(mut world, parent, children)| {
+                        world.entity_mut(parent).add_children(&children);
+                        black_box(world.get::<Children>(parent).map(|children| children.len()));
+                    },
+                    BatchSize::LargeInput,
+                );
+            },
+        );
+    }
+
+    for child_count in [10, 1_000, 10_000, 100_000] {
+        for (case, index) in [
+            ("remove_first_child", 0),
+            ("remove_middle_child", child_count / 2),
+            ("remove_last_child", child_count - 1),
+        ] {
+            group.bench_with_input(
+                BenchmarkId::new(case, child_count),
+                &child_count,
+                |bencher, &child_count| {
+                    bencher.iter_batched(
+                        || {
+                            let mut world = World::new();
+                            let parent = world.spawn_empty().id();
+                            let children = spawn_children(&mut world, parent, child_count);
+                            (world, parent, children[index])
+                        },
+                        |(mut world, parent, child)| {
+                            world.entity_mut(child).remove::<ChildOf>();
+                            black_box(world.get::<Children>(parent).map(|children| children.len()));
+                        },
+                        BatchSize::LargeInput,
+                    );
+                },
+            );
+        }
+    }
+
+    for child_count in [100, 1_000, 10_000] {
+        group.bench_with_input(
+            BenchmarkId::new("reparent_many_children", child_count),
+            &child_count,
+            |bencher, &child_count| {
+                bencher.iter_batched(
+                    || {
+                        let mut world = World::new();
+                        let old_parent = world.spawn_empty().id();
+                        let new_parent = world.spawn_empty().id();
+                        let children = spawn_children(&mut world, old_parent, child_count);
+                        (world, old_parent, new_parent, children)
+                    },
+                    |(mut world, old_parent, new_parent, children)| {
+                        for child in children {
+                            world.entity_mut(child).insert(ChildOf(new_parent));
+                        }
+                        black_box(
+                            world
+                                .get::<Children>(old_parent)
+                                .map(|children| children.len()),
+                        );
+                        black_box(
+                            world
+                                .get::<Children>(new_parent)
+                                .map(|children| children.len()),
+                        );
+                    },
+                    BatchSize::LargeInput,
+                );
+            },
+        );
+
+        group.bench_with_input(
+            BenchmarkId::new("despawn_whole_tree", child_count),
+            &child_count,
+            |bencher, &child_count| {
+                bencher.iter_batched(
+                    || {
+                        let mut world = World::new();
+                        let root = world.spawn_empty().id();
+                        spawn_children(&mut world, root, child_count);
+                        (world, root)
+                    },
+                    |(mut world, root)| {
+                        world.entity_mut(root).despawn();
+                        black_box(world.entities().len());
+                    },
+                    BatchSize::LargeInput,
+                );
+            },
+        );
+    }
+
+    for depth in [100, 1_000, 10_000] {
+        group.bench_with_input(
+            BenchmarkId::new("deep_tree_ancestors", depth),
+            &depth,
+            |bencher, &depth| {
+                let mut world = World::new();
+                let (_, leaf) = spawn_child_chain(&mut world, depth);
+                let mut query = world.query::<&ChildOf>();
+                bencher.iter(|| {
+                    black_box(query.query(&world).iter_ancestors::<ChildOf>(leaf).count());
+                });
+            },
+        );
+
+        group.bench_with_input(
+            BenchmarkId::new("deep_tree_descendants", depth),
+            &depth,
+            |bencher, &depth| {
+                let mut world = World::new();
+                let (root, _) = spawn_child_chain(&mut world, depth);
+                let mut query = world.query::<&Children>();
+                bencher.iter(|| {
+                    black_box(
+                        query
+                            .query(&world)
+                            .iter_descendants_depth_first::<Children>(root)
+                            .count(),
+                    );
+                });
+            },
+        );
+    }
+
+    for child_count in [100, 1_000, 10_000, 100_000] {
+        group.bench_with_input(
+            BenchmarkId::new("wide_tree_descendants", child_count),
+            &child_count,
+            |bencher, &child_count| {
+                let mut world = World::new();
+                let root = world.spawn_empty().id();
+                spawn_children(&mut world, root, child_count);
+                let mut query = world.query::<&Children>();
+                bencher.iter(|| {
+                    black_box(
+                        query
+                            .query(&world)
+                            .iter_descendants::<Children>(root)
+                            .count(),
+                    );
+                });
+            },
+        );
+    }
+
+    macro_rules! bench_collection {
+        ($relationship:ty, $name:literal) => {
+            for source_count in [10, 100, 1_000, 10_000] {
+                group.bench_with_input(
+                    BenchmarkId::new(concat!("collection_add_remove/", $name), source_count),
+                    &source_count,
+                    |bencher, &source_count| {
+                        bencher.iter_batched(
+                            || {
+                                let mut world = World::new();
+                                let target = world.spawn_empty().id();
+                                let sources = (0..source_count)
+                                    .map(|_| world.spawn_empty().id())
+                                    .collect::<Vec<_>>();
+                                (world, target, sources)
+                            },
+                            |(mut world, target, sources)| {
+                                for source in &sources {
+                                    world
+                                        .entity_mut(*source)
+                                        .insert(<$relationship as Relationship>::from(target));
+                                }
+                                for source in &sources {
+                                    world.entity_mut(*source).remove::<$relationship>();
+                                }
+                                black_box(world.entities().len());
+                            },
+                            BatchSize::LargeInput,
+                        );
+                    },
+                );
+            }
+        };
+    }
+
+    bench_collection!(VecRel, "vec");
+    bench_collection!(SmallVecRel, "smallvec");
+    bench_collection!(HashSetRel, "entity_hash_set");
+    bench_collection!(IndexSetRel, "entity_index_set");
+
+    group.finish();
+}
+
 criterion_group!(
     benches,
     query_update_archetypes,
@@ -1476,5 +1735,6 @@ criterion_group!(
     change_detection_filters,
     observer_dispatch_pressure,
     observer_and_relationship_storms,
+    relationship_hierarchy_pressure,
 );
 criterion_main!(benches);

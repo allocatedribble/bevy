@@ -804,12 +804,113 @@ mod tests {
     use core::marker::PhantomData;
     use core::sync::atomic::AtomicBool;
 
-    use crate::lifecycle::HookContext;
-    use crate::prelude::{ChildOf, Children};
-    use crate::relationship::{Relationship, RelationshipAccessor};
+    use crate::lifecycle::{Add, HookContext, Remove};
+    use crate::observer::On;
+    use crate::prelude::{ChildOf, Children, ResMut, Resource};
+    use crate::relationship::{Relationship, RelationshipAccessor, RelationshipTarget};
     use crate::world::{DeferredWorld, World};
     use crate::{component::Component, entity::Entity};
     use alloc::vec::Vec;
+
+    #[derive(Component)]
+    #[relationship(relationship_target = MirrorTarget)]
+    struct MirrorRel(Entity);
+
+    #[derive(Component)]
+    #[relationship_target(relationship = MirrorRel)]
+    struct MirrorTarget(Vec<Entity>);
+
+    #[derive(Resource, Default)]
+    struct RelationshipObserverCounts {
+        target_added: usize,
+        target_removed: usize,
+    }
+
+    struct Lcg(u64);
+
+    impl Lcg {
+        fn next(&mut self) -> u64 {
+            self.0 = self
+                .0
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            self.0
+        }
+
+        fn range(&mut self, end: usize) -> usize {
+            (self.next() as usize) % end
+        }
+    }
+
+    fn live_entities(world: &World, entities: &[Entity]) -> Vec<Entity> {
+        entities
+            .iter()
+            .copied()
+            .filter(|entity| world.get_entity(*entity).is_ok())
+            .collect()
+    }
+
+    fn pick_live_entity(rng: &mut Lcg, world: &World, entities: &[Entity]) -> Option<Entity> {
+        let live = live_entities(world, entities);
+        (!live.is_empty()).then(|| live[rng.range(live.len())])
+    }
+
+    fn pick_related_source(rng: &mut Lcg, world: &World, entities: &[Entity]) -> Option<Entity> {
+        let sources = entities
+            .iter()
+            .copied()
+            .filter(|entity| world.get::<MirrorRel>(*entity).is_some())
+            .collect::<Vec<_>>();
+        (!sources.is_empty()).then(|| sources[rng.range(sources.len())])
+    }
+
+    fn assert_mirror_matches_sources(world: &mut World) {
+        let mut source_query = world.query::<(Entity, &MirrorRel)>();
+        let sources = source_query
+            .iter(world)
+            .map(|(source, relationship)| (source, relationship.get()))
+            .collect::<Vec<_>>();
+
+        let mut expected = Vec::<(Entity, Vec<Entity>)>::new();
+        for (source, target) in sources {
+            assert!(
+                world.get_entity(target).is_ok(),
+                "relationship source {source:?} points at dead target {target:?}"
+            );
+            if let Some((_, sources)) = expected
+                .iter_mut()
+                .find(|(expected_target, _)| *expected_target == target)
+            {
+                sources.push(source);
+            } else {
+                expected.push((target, alloc::vec![source]));
+            }
+        }
+        for (_, sources) in &mut expected {
+            sources.sort_unstable();
+        }
+        expected.sort_unstable_by_key(|(target, _)| *target);
+
+        let mut target_query = world.query::<(Entity, &MirrorTarget)>();
+        let mut actual = target_query
+            .iter(world)
+            .map(|(target, mirror)| {
+                let mut sources = mirror.iter().collect::<Vec<_>>();
+                let original_len = sources.len();
+                sources.sort_unstable();
+                sources.dedup();
+                assert_eq!(
+                    original_len,
+                    sources.len(),
+                    "relationship target {target:?} contains duplicate sources"
+                );
+                (target, sources)
+            })
+            .collect::<Vec<_>>();
+        actual.sort_unstable_by_key(|(target, _)| *target);
+
+        assert_eq!(actual, expected);
+    }
 
     #[test]
     fn custom_relationship() {
@@ -826,6 +927,101 @@ mod tests {
         let b = world.spawn(Likes(a)).id();
         let c = world.spawn(Likes(a)).id();
         assert_eq!(world.entity(a).get::<LikedBy>().unwrap().0, &[b, c]);
+    }
+
+    #[test]
+    fn randomized_relationship_mirror_oracle() {
+        for seed in [1, 2, 0x5eed_5eed] {
+            let mut rng = Lcg(seed);
+            let mut world = World::new();
+            let mut entities = (0..8).map(|_| world.spawn_empty().id()).collect::<Vec<_>>();
+
+            for _ in 0..512 {
+                match rng.range(8) {
+                    0 | 1 => {
+                        if let (Some(source), Some(target)) = (
+                            pick_live_entity(&mut rng, &world, &entities),
+                            pick_live_entity(&mut rng, &world, &entities),
+                        ) {
+                            world.entity_mut(source).insert(MirrorRel(target));
+                        }
+                    }
+                    2 => {
+                        if let Some(source) = pick_related_source(&mut rng, &world, &entities) {
+                            world.entity_mut(source).remove::<MirrorRel>();
+                        }
+                    }
+                    3 => {
+                        if let Some(entity) = pick_live_entity(&mut rng, &world, &entities) {
+                            world.entity_mut(entity).despawn();
+                        }
+                    }
+                    4 => {
+                        entities.push(world.spawn_empty().id());
+                    }
+                    5 => {
+                        if let Some(source) = pick_live_entity(&mut rng, &world, &entities) {
+                            let dead_target = world.spawn_empty().id();
+                            world.entity_mut(dead_target).despawn();
+                            world.entity_mut(source).insert(MirrorRel(dead_target));
+                        }
+                    }
+                    6 => {
+                        if let (Some(source), Some(target)) = (
+                            pick_related_source(&mut rng, &world, &entities),
+                            pick_live_entity(&mut rng, &world, &entities),
+                        ) {
+                            world
+                                .modify_component::<MirrorRel, _>(source, |relationship| {
+                                    relationship.set_risky(target);
+                                })
+                                .expect("selected source entity is live");
+                        }
+                    }
+                    _ => {
+                        if let Some(target) = pick_live_entity(&mut rng, &world, &entities) {
+                            entities.extend(
+                                world
+                                    .spawn_batch((0..3).map(|_| MirrorRel(target)))
+                                    .collect::<Vec<_>>(),
+                            );
+                        }
+                    }
+                }
+
+                world.flush();
+                assert_mirror_matches_sources(&mut world);
+            }
+        }
+    }
+
+    #[test]
+    fn observer_runs_during_relationship_target_maintenance() {
+        let mut world = World::new();
+        world.init_resource::<RelationshipObserverCounts>();
+        world.add_observer(
+            |_: On<Add, MirrorTarget>, mut counts: ResMut<RelationshipObserverCounts>| {
+                counts.target_added += 1;
+            },
+        );
+        world.add_observer(
+            |_: On<Remove, MirrorTarget>, mut counts: ResMut<RelationshipObserverCounts>| {
+                counts.target_removed += 1;
+            },
+        );
+
+        let target = world.spawn_empty().id();
+        let source = world.spawn(MirrorRel(target)).id();
+        assert_eq!(
+            world.resource::<RelationshipObserverCounts>().target_added,
+            1
+        );
+
+        world.entity_mut(source).remove::<MirrorRel>();
+        world.flush();
+        let counts = world.resource::<RelationshipObserverCounts>();
+        assert_eq!(counts.target_added, 1);
+        assert_eq!(counts.target_removed, 1);
     }
 
     #[test]

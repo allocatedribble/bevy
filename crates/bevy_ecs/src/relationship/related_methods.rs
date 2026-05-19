@@ -187,7 +187,13 @@ impl<'w> EntityWorldMut<'w> {
 
         // SAFETY: The entities we're inserting will be the entities that were either already there or entities that we've just inserted.
         collection.clear();
-        collection.extend_from_iter(related.iter().copied());
+        let mut seen = EntityHashSet::with_capacity(related.len());
+        collection.extend_from_iter(
+            related
+                .iter()
+                .copied()
+                .filter(|entity| seen.insert(*entity)),
+        );
         self.insert(relations);
 
         self
@@ -221,11 +227,29 @@ impl<'w> EntityWorldMut<'w> {
     ) -> &mut Self {
         #[cfg(debug_assertions)]
         {
+            let entities_to_relate_len = entities_to_relate.len();
+            let entities_to_unrelate_len = entities_to_unrelate.len();
+            let newly_related_entities_len = newly_related_entities.len();
             let entities_to_relate = EntityHashSet::from_iter(entities_to_relate.iter().copied());
             let entities_to_unrelate =
                 EntityHashSet::from_iter(entities_to_unrelate.iter().copied());
             let mut newly_related_entities =
                 EntityHashSet::from_iter(newly_related_entities.iter().copied());
+            assert_eq!(
+                entities_to_relate.len(),
+                entities_to_relate_len,
+                "`entities_to_relate` ({entities_to_relate:?}) contained duplicates"
+            );
+            assert_eq!(
+                entities_to_unrelate.len(),
+                entities_to_unrelate_len,
+                "`entities_to_unrelate` ({entities_to_unrelate:?}) contained duplicates"
+            );
+            assert_eq!(
+                newly_related_entities.len(),
+                newly_related_entities_len,
+                "`newly_related_entities` ({newly_related_entities:?}) contained duplicates"
+            );
             assert!(
                 entities_to_relate.is_disjoint(&entities_to_unrelate),
                 "`entities_to_relate` ({entities_to_relate:?}) shared entities with `entities_to_unrelate` ({entities_to_unrelate:?})"

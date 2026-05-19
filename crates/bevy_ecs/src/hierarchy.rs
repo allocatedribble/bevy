@@ -920,6 +920,32 @@ mod tests {
     }
 
     #[test]
+    fn replace_children_deduplicates_input() {
+        let mut world = World::new();
+
+        let parent = world.spawn_empty().id();
+        let child_a = world.spawn_empty().id();
+        let child_b = world.spawn_empty().id();
+
+        world
+            .entity_mut(parent)
+            .replace_children(&[child_a, child_b, child_a, child_b]);
+
+        assert_eq!(
+            world.entity(parent).get::<Children>().unwrap().0,
+            [child_a, child_b]
+        );
+        assert_eq!(
+            world.entity(child_a).get::<ChildOf>().unwrap(),
+            &ChildOf(parent)
+        );
+        assert_eq!(
+            world.entity(child_b).get::<ChildOf>().unwrap(),
+            &ChildOf(parent)
+        );
+    }
+
+    #[test]
     fn replace_with_difference() {
         let mut world = World::new();
 
@@ -1141,6 +1167,25 @@ mod tests {
         world.entity_mut(parent).replace_children_with_difference(
             &[],
             &[child_a, child_b],
+            &[child_a],
+        );
+    }
+
+    #[test]
+    #[should_panic]
+    #[cfg_attr(
+        not(debug_assertions),
+        ignore = "we don't check invariants if debug assertions are off"
+    )]
+    fn replace_diff_invariant_duplicate_entities_to_relate() {
+        let mut world = World::new();
+
+        let parent = world.spawn_empty().id();
+        let child_a = world.spawn_empty().id();
+
+        world.entity_mut(parent).replace_children_with_difference(
+            &[],
+            &[child_a, child_a],
             &[child_a],
         );
     }
