@@ -7,7 +7,7 @@ enable wgpu_ray_query;
 #import bevy_pbr::pbr_functions::calculate_F0
 #import bevy_pbr::utils::{rand_f, sample_cosine_hemisphere}
 #import bevy_render::maths::{PI, orthonormalize}
-#import bevy_solari::sampling::{sample_ggx_vndf, ggx_vndf_pdf, ggx_vndf_sample_invalid}
+#import bevy_solari::sampling::{sample_ggx_vndf, ggx_vndf_pdf, ggx_vndf_sample_invalid, finite, finite3, safe_normalize_or_zero, safe_positive_pdf}
 #import bevy_solari::scene_bindings::{ResolvedMaterial, MIRROR_ROUGHNESS_THRESHOLD, brdf_dfg_lut, brdf_dfg_lut_sampler}
 
 struct EvaluateAndSampleBrdfResult {
@@ -39,10 +39,14 @@ fn evaluate_and_sample_brdf(
     rng: ptr<function, u32>,
 ) -> EvaluateAndSampleBrdfResult {
     let NdotV = dot(world_normal, wo);
-    if NdotV < 0.0001 { return EvaluateAndSampleBrdfResult(vec3(0.0), vec3(0.0), 0.0); }
+    if !finite(NdotV) || NdotV < 0.0001 { return EvaluateAndSampleBrdfResult(vec3(0.0), vec3(0.0), 0.0); }
     let F0 = calculate_F0(material.base_color, material.metallic, vec3(material.reflectance));
     let rho = lobe_reflectances(F0, material, NdotV);
-    let specular_weight = luminance(rho.specular) / luminance(rho.specular + rho.diffuse);
+    let rho_sum_luminance = luminance(rho.specular + rho.diffuse);
+    if !safe_positive_pdf(rho_sum_luminance) {
+        return EvaluateAndSampleBrdfResult(vec3(0.0), vec3(0.0), 0.0);
+    }
+    let specular_weight = saturate(luminance(rho.specular) / rho_sum_luminance);
     let diffuse_weight = 1.0 - specular_weight;
 
     let TBN = orthonormalize(world_normal);
@@ -67,6 +71,9 @@ fn evaluate_and_sample_brdf(
 
         // Mirror specular is a delta function
         if material.roughness <= MIRROR_ROUGHNESS_THRESHOLD {
+            if !safe_positive_pdf(specular_weight) {
+                return EvaluateAndSampleBrdfResult(vec3(0.0), vec3(0.0), 0.0);
+            }
             return EvaluateAndSampleBrdfResult(
                 wi,
                 evaluate_specular_brdf(wo, wi, world_normal, material) / specular_weight,
@@ -78,7 +85,13 @@ fn evaluate_and_sample_brdf(
     let diffuse_pdf = wi_tangent.z / PI;
     let specular_pdf = ggx_vndf_pdf(wo_tangent, wi_tangent, material.roughness);
     let pdf = (diffuse_weight * diffuse_pdf) + (specular_weight * specular_pdf);
+    if !safe_positive_pdf(pdf) {
+        return EvaluateAndSampleBrdfResult(vec3(0.0), vec3(0.0), 0.0);
+    }
     let throughput = evaluate_brdf(wo, wi, world_normal, material) / pdf;
+    if !finite3(throughput) {
+        return EvaluateAndSampleBrdfResult(vec3(0.0), vec3(0.0), 0.0);
+    }
     return EvaluateAndSampleBrdfResult(wi, throughput, pdf);
 }
 
@@ -101,7 +114,10 @@ fn evaluate_diffuse_brdf(wo: vec3<f32>, wi: vec3<f32>, world_normal: vec3<f32>, 
 }
 
 fn evaluate_specular_brdf(wo: vec3<f32>, wi: vec3<f32>, world_normal: vec3<f32>, material: ResolvedMaterial) -> vec3<f32> {
-    let H = normalize(wi + wo);
+    let H = safe_normalize_or_zero(wi + wo);
+    if all(H == vec3(0.0)) {
+        return vec3(0.0);
+    }
     let NdotL = dot(world_normal, wi);
     let NdotH = dot(world_normal, H);
     let LdotH = dot(wi, H);
@@ -129,7 +145,11 @@ fn brdf_pdf(wo: vec3<f32>, wi: vec3<f32>, world_normal: vec3<f32>, material: Res
     let NdotV = max(dot(world_normal, wo), 0.0001);
     let F0 = calculate_F0(material.base_color, material.metallic, vec3(material.reflectance));
     let rho = lobe_reflectances(F0, material, NdotV);
-    let specular_weight = luminance(rho.specular) / luminance(rho.specular + rho.diffuse);
+    let rho_sum_luminance = luminance(rho.specular + rho.diffuse);
+    if !safe_positive_pdf(rho_sum_luminance) {
+        return 0.0;
+    }
+    let specular_weight = saturate(luminance(rho.specular) / rho_sum_luminance);
     let diffuse_weight = 1.0 - specular_weight;
 
     let TBN = orthonormalize(world_normal);

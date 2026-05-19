@@ -45,11 +45,71 @@ fn pixel_dissimilar(depth: f32, world_position: vec3<f32>, other_world_position:
     return tangent_plane_distance / view_z > 0.003 || dot(normal, other_normal) < 0.0;
 }
 
+fn pixel_dissimilar_di(
+    depth: f32,
+    world_position: vec3<f32>,
+    other_world_position: vec3<f32>,
+    normal: vec3<f32>,
+    other_normal: vec3<f32>,
+    material: ResolvedMaterial,
+    other_material: ResolvedMaterial,
+    view: View,
+) -> bool {
+    return pixel_dissimilar(depth, world_position, other_world_position, normal, other_normal, view)
+        || material_dissimilar(material, other_material, 0.08, 0.06, 0.12, 0.24);
+}
+
+fn pixel_dissimilar_gi(
+    depth: f32,
+    world_position: vec3<f32>,
+    other_world_position: vec3<f32>,
+    normal: vec3<f32>,
+    other_normal: vec3<f32>,
+    material: ResolvedMaterial,
+    other_material: ResolvedMaterial,
+    view: View,
+) -> bool {
+    return pixel_dissimilar(depth, world_position, other_world_position, normal, other_normal, view)
+        || material_dissimilar(material, other_material, 0.18, 0.12, 0.25, 0.45);
+}
+
+fn material_dissimilar(
+    material: ResolvedMaterial,
+    other_material: ResolvedMaterial,
+    roughness_delta_max: f32,
+    metallic_delta_max: f32,
+    base_luminance_delta_max: f32,
+    base_color_distance_max: f32,
+) -> bool {
+    if abs(material.roughness - other_material.roughness) > roughness_delta_max {
+        return true;
+    }
+    if abs(material.metallic - other_material.metallic) > metallic_delta_max {
+        return true;
+    }
+
+    let base_luminance = material_luminance(material.base_color);
+    let other_base_luminance = material_luminance(other_material.base_color);
+    if abs(base_luminance - other_base_luminance) > base_luminance_delta_max {
+        return true;
+    }
+    if length(material.base_color - other_material.base_color) > base_color_distance_max {
+        return true;
+    }
+
+    return (material_luminance(material.emissive) > 0.001) != (material_luminance(other_material.emissive) > 0.001);
+}
+
+fn material_luminance(color: vec3<f32>) -> f32 {
+    return dot(color, vec3(0.2126, 0.7152, 0.0722));
+}
+
 fn permute_pixel(pixel_id: vec2<u32>, frame_index: u32, view_size: vec2<f32>) -> vec2<u32> {
-    let r = frame_index;
-    let offset = vec2(r & 3u, (r >> 2u) & 3u);
-    var shifted_pixel_id = pixel_id + offset;
-    shifted_pixel_id ^= vec2(3u);
-    shifted_pixel_id -= offset;
-    return min(shifted_pixel_id, vec2<u32>(view_size - 1.0));
+    let offset = vec2<i32>(i32(frame_index & 3u), i32((frame_index >> 2u) & 3u));
+    let max_pixel = max(vec2<i32>(view_size) - vec2<i32>(1), vec2<i32>(0));
+
+    let shifted = vec2<i32>(pixel_id) + offset;
+    let permuted = (shifted ^ vec2<i32>(3)) - offset;
+
+    return vec2<u32>(clamp(permuted, vec2<i32>(0), max_pixel));
 }

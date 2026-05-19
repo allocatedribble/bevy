@@ -1,4 +1,4 @@
-use super::SolariLighting;
+use super::{SolariDebugMode, SolariLighting};
 #[cfg(all(feature = "dlss", not(feature = "force_disable_dlss")))]
 use bevy_anti_alias::dlss::{
     Dlss, DlssRayReconstructionFeature, ViewDlssRayReconstructionTextures,
@@ -22,7 +22,7 @@ use bevy_render::{
         Buffer, BufferDescriptor, BufferUsages, TextureDescriptor, TextureDimension, TextureFormat,
         TextureUsages, TextureView, TextureViewDescriptor,
     },
-    renderer::RenderDevice,
+    renderer::{RenderDevice, RenderQueue},
 };
 
 /// Size of the `LightSample` shader struct in bytes.
@@ -33,6 +33,7 @@ const RESOLVED_LIGHT_SAMPLE_STRUCT_SIZE: u64 = 24;
 
 /// Size of the GI `Reservoir` shader struct in bytes.
 const GI_RESERVOIR_STRUCT_SIZE: u64 = 48;
+const SOLARI_DEBUG_COUNTER_STRUCT_SIZE: u64 = 8 * size_of::<u32>() as u64;
 
 pub const LIGHT_TILE_BLOCKS: u64 = 128;
 pub const LIGHT_TILE_SAMPLES_PER_BLOCK: u64 = 1024;
@@ -60,7 +61,25 @@ pub struct SolariLightingResources {
     pub world_cache_active_cell_indices: Buffer,
     pub world_cache_active_cells_count: Buffer,
     pub world_cache_active_cells_dispatch: Buffer,
+    pub debug_mode: Buffer,
+    pub debug_counters: Buffer,
     pub view_size: UVec2,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct SolariDebugModeUniform {
+    flags: u32,
+    _padding: [u32; 3],
+}
+
+impl From<SolariDebugMode> for SolariDebugModeUniform {
+    fn from(value: SolariDebugMode) -> Self {
+        Self {
+            flags: value.bits(),
+            _padding: [0; 3],
+        }
+    }
 }
 
 pub fn prepare_solari_lighting_resources(
@@ -84,8 +103,12 @@ pub fn prepare_solari_lighting_resources(
         With<SolariLighting>,
     >,
     render_device: Res<RenderDevice>,
+    render_queue: Res<RenderQueue>,
+    debug_mode: Option<Res<SolariDebugMode>>,
     mut commands: Commands,
 ) {
+    let debug_mode = debug_mode.map(|mode| *mode).unwrap_or_default();
+
     for query_item in &query {
         #[cfg(any(not(feature = "dlss"), feature = "force_disable_dlss"))]
         let (entity, camera, solari_lighting_resources, resolution_override) = query_item;
@@ -100,7 +123,14 @@ pub fn prepare_solari_lighting_resources(
             view_size = *resolution_override;
         }
 
-        if solari_lighting_resources.map(|r| r.view_size) == Some(view_size) {
+        if let Some(solari_lighting_resources) = solari_lighting_resources
+            && solari_lighting_resources.view_size == view_size
+        {
+            render_queue.write_buffer(
+                &solari_lighting_resources.debug_mode,
+                0,
+                bytemuck::bytes_of(&SolariDebugModeUniform::from(debug_mode)),
+            );
             continue;
         }
 
@@ -225,6 +255,25 @@ pub fn prepare_solari_lighting_resources(
             mapped_at_creation: false,
         });
 
+        let debug_mode_buffer = render_device.create_buffer(&BufferDescriptor {
+            label: Some("solari_lighting_debug_mode"),
+            size: size_of::<SolariDebugModeUniform>() as u64,
+            usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        render_queue.write_buffer(
+            &debug_mode_buffer,
+            0,
+            bytemuck::bytes_of(&SolariDebugModeUniform::from(debug_mode)),
+        );
+
+        let debug_counters = render_device.create_buffer(&BufferDescriptor {
+            label: Some("solari_lighting_debug_counters"),
+            size: SOLARI_DEBUG_COUNTER_STRUCT_SIZE,
+            usage: BufferUsages::STORAGE | BufferUsages::COPY_SRC | BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
         commands.entity(entity).insert(SolariLightingResources {
             light_tile_samples,
             light_tile_resolved_samples,
@@ -243,6 +292,8 @@ pub fn prepare_solari_lighting_resources(
             world_cache_active_cell_indices,
             world_cache_active_cells_count,
             world_cache_active_cells_dispatch,
+            debug_mode: debug_mode_buffer,
+            debug_counters,
             view_size,
         });
 

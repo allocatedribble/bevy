@@ -4,15 +4,24 @@ enable wgpu_ray_query;
 
 #import bevy_core_pipeline::tonemapping::tonemapping_luminance as luminance
 #import bevy_pbr::pbr_functions::{calculate_diffuse_color, calculate_F0}
-#import bevy_pbr::utils::rand_f
+#import bevy_pbr::utils::{rand_f, rand_range_u}
 #import bevy_render::maths::{orthonormalize, PI}
 #import bevy_render::view::View
 #import bevy_solari::brdf::{evaluate_brdf, evaluate_specular_brdf}
 #import bevy_solari::gbuffer_utils::{gpixel_resolve, ResolvedGPixel}
-#import bevy_solari::sampling::{sample_random_light, random_emissive_light_pdf, sample_ggx_vndf, ggx_vndf_pdf, ggx_vndf_sample_invalid, power_heuristic}
+#import bevy_solari::presample_light_tiles::unpack_resolved_light_sample
+#import bevy_solari::sampling::{sample_random_light, random_emissive_light_pdf, calculate_resolved_light_contribution, trace_light_visibility, sample_ggx_vndf, ggx_vndf_pdf, ggx_vndf_sample_invalid, power_heuristic, finite, finite3, max_component, safe_normalize_or_zero, safe_positive_pdf}
 #import bevy_solari::scene_bindings::{trace_ray, resolve_ray_hit_full, ResolvedRayHitFull, RAY_T_MIN, RAY_T_MAX, MIRROR_ROUGHNESS_THRESHOLD}
+#import bevy_solari::solari_debug::{
+    solari_debug_count_invalid_gi_reuse,
+    solari_debug_is_inf,
+    solari_debug_is_nan,
+    solari_debug_validate_radiance,
+    solari_debug_visualize_temporal_sources,
+    solari_debug_visualize_world_cache,
+}
 #import bevy_solari::world_cache::{query_world_cache, get_cell_size, WORLD_CACHE_CELL_LIFETIME}
-#import bevy_solari::realtime_bindings::{view_output, gi_reservoirs_a, gbuffer, depth_buffer, view, constants}
+#import bevy_solari::realtime_bindings::{view_output, light_tile_resolved_samples, gi_reservoirs_a, gbuffer, depth_buffer, view, constants, Reservoir}
 #ifdef DLSS_RR_GUIDE_BUFFERS
 #import bevy_solari::realtime_bindings::{diffuse_albedo, specular_albedo, normal_roughness, specular_motion_vectors, previous_view}
 #import bevy_solari::resolve_dlss_rr_textures::env_brdf_approx2
@@ -20,6 +29,7 @@ enable wgpu_ray_query;
 
 const DIFFUSE_GI_REUSE_ROUGHNESS_THRESHOLD: f32 = 0.4;
 const SPECULAR_GI_FOR_DI_ROUGHNESS_THRESHOLD: f32 = 0.0225;
+const SPECULAR_NEE_RIS_CANDIDATES = 4u;
 
 @compute @workgroup_size(8, 8, 1)
 fn specular_gi(@builtin(global_invocation_id) global_id: vec3<u32>) {
@@ -33,9 +43,15 @@ fn specular_gi(@builtin(global_invocation_id) global_id: vec3<u32>) {
         return;
     }
     let surface = gpixel_resolve(textureLoad(gbuffer, global_id.xy, 0), depth, global_id.xy, view.main_pass_viewport.zw, view.world_from_clip);
+    if solari_debug_visualize_temporal_sources() {
+        return;
+    }
 
     let wo_unnormalized = view.world_position - surface.world_position;
     let wo_length = length(wo_unnormalized);
+    if !(wo_length > RAY_T_MIN) || !finite(wo_length) {
+        return;
+    }
     let wo = wo_unnormalized / wo_length;
 
     var radiance: vec3<f32>;
@@ -43,8 +59,20 @@ fn specular_gi(@builtin(global_invocation_id) global_id: vec3<u32>) {
     if surface.material.roughness > DIFFUSE_GI_REUSE_ROUGHNESS_THRESHOLD {
         // Surface is very rough, reuse the ReSTIR GI reservoir
         let gi_reservoir = gi_reservoirs_a[pixel_index];
-        wi = normalize(gi_reservoir.sample_point_world_position - surface.world_position);
-        radiance = gi_reservoir.radiance * gi_reservoir.unbiased_contribution_weight;
+        if reservoir_reusable(gi_reservoir, surface.world_position) {
+            let delta = gi_reservoir.sample_point_world_position - surface.world_position;
+            wi = safe_normalize_or_zero(delta);
+            if all(wi == vec3(0.0)) {
+                solari_debug_count_invalid_gi_reuse();
+                return;
+            }
+            radiance = gi_reservoir.radiance * gi_reservoir.unbiased_contribution_weight;
+        } else {
+            if reservoir_has_payload(gi_reservoir) {
+                solari_debug_count_invalid_gi_reuse();
+            }
+            return;
+        }
     } else {
         // Surface is glossy or mirror-like, trace a new path
         let TBN = orthonormalize(surface.world_normal);
@@ -59,6 +87,9 @@ fn specular_gi(@builtin(global_invocation_id) global_id: vec3<u32>) {
         } else {
             wi = wi_tangent.x * T + wi_tangent.y * B + wi_tangent.z * N;
             let pdf = ggx_vndf_pdf(wo_tangent, wi_tangent, surface.material.roughness);
+            if surface.material.roughness > MIRROR_ROUGHNESS_THRESHOLD && !safe_positive_pdf(pdf) {
+                return;
+            }
 
             radiance = trace_glossy_path(global_id.xy, surface, wo_length, wi, pdf, &rng);
             if surface.material.roughness > MIRROR_ROUGHNESS_THRESHOLD {
@@ -68,15 +99,49 @@ fn specular_gi(@builtin(global_invocation_id) global_id: vec3<u32>) {
     }
 
     let brdf = evaluate_specular_brdf(wo, wi, surface.world_normal, surface.material);
-    radiance *= brdf * view.exposure;
+    radiance = solari_debug_validate_radiance(radiance * brdf * view.exposure);
+    if !finite3(radiance) {
+        return;
+    }
 
     var pixel_color = textureLoad(view_output, global_id.xy);
     pixel_color += vec4(radiance, 0.0);
     textureStore(view_output, global_id.xy, pixel_color);
 
-#ifdef VISUALIZE_WORLD_CACHE
-    textureStore(view_output, global_id.xy, vec4(query_world_cache(surface.world_position, surface.world_normal, view.world_position, RAY_T_MAX, WORLD_CACHE_CELL_LIFETIME, &rng) * view.exposure, 1.0));
-#endif
+    if solari_debug_visualize_world_cache() {
+        textureStore(view_output, global_id.xy, vec4(solari_debug_validate_radiance(query_world_cache(surface.world_position, surface.world_normal, view.world_position, RAY_T_MAX, WORLD_CACHE_CELL_LIFETIME, true, &rng) * view.exposure), 1.0));
+    }
+}
+
+fn reservoir_has_payload(reservoir: Reservoir) -> bool {
+    return reservoir.confidence_weight > 0.0
+        || reservoir.weight_sum > 0.0
+        || reservoir.unbiased_contribution_weight > 0.0
+        || any(reservoir.radiance != vec3(0.0));
+}
+
+fn reservoir_has_nan_inf(reservoir: Reservoir) -> bool {
+    return solari_debug_is_nan(reservoir.confidence_weight)
+        || solari_debug_is_inf(reservoir.confidence_weight)
+        || solari_debug_is_nan(reservoir.weight_sum)
+        || solari_debug_is_inf(reservoir.weight_sum)
+        || solari_debug_is_nan(reservoir.unbiased_contribution_weight)
+        || solari_debug_is_inf(reservoir.unbiased_contribution_weight)
+        || solari_debug_is_nan(reservoir.radiance.x)
+        || solari_debug_is_inf(reservoir.radiance.x)
+        || solari_debug_is_nan(reservoir.radiance.y)
+        || solari_debug_is_inf(reservoir.radiance.y)
+        || solari_debug_is_nan(reservoir.radiance.z)
+        || solari_debug_is_inf(reservoir.radiance.z);
+}
+
+fn reservoir_reusable(reservoir: Reservoir, world_position: vec3<f32>) -> bool {
+    if !reservoir_has_payload(reservoir) || reservoir_has_nan_inf(reservoir) {
+        return false;
+    }
+
+    let to_sample = reservoir.sample_point_world_position - world_position;
+    return dot(to_sample, to_sample) > RAY_T_MIN * RAY_T_MIN;
 }
 
 fn trace_glossy_path(pixel_id: vec2<u32>, primary_surface: ResolvedGPixel, initial_ray_t: f32, initial_wi: vec3<f32>, initial_p_bounce: f32, rng: ptr<function, u32>) -> vec3<f32> {
@@ -135,14 +200,19 @@ fn trace_glossy_path(pixel_id: vec2<u32>, primary_surface: ResolvedGPixel, initi
 
         if i == 2u || (ray_longer_than_cell && path_roughness > DIFFUSE_GI_REUSE_ROUGHNESS_THRESHOLD) {
             let diffuse_brdf = ray_hit.material.base_color / PI;
-            radiance += throughput * diffuse_brdf * query_world_cache(ray_hit.world_position, ray_hit.geometric_world_normal, view.world_position, ray.t, WORLD_CACHE_CELL_LIFETIME, rng);
+            radiance += throughput * diffuse_brdf * query_world_cache(ray_hit.world_position, ray_hit.geometric_world_normal, view.world_position, ray.t, WORLD_CACHE_CELL_LIFETIME, true, rng);
             break;
         } else if !surface_perfect_mirror {
             // Sample direct lighting (NEE)
-            let direct_lighting = sample_random_light(ray_hit.world_position, ray_hit.world_normal, rng);
-            let direct_lighting_brdf = evaluate_brdf(wo, direct_lighting.wi, ray_hit.world_normal, ray_hit.material);
-            let mis_weight = nee_mis_weight(direct_lighting.inverse_pdf, direct_lighting.brdf_rays_can_hit, wo_tangent, direct_lighting.wi, ray_hit, TBN);
-            radiance += throughput * mis_weight * direct_lighting.radiance * direct_lighting.inverse_pdf * direct_lighting_brdf;
+            let nee_probability = specular_nee_probability(throughput, ray_hit.material.roughness, i);
+            if rand_f(rng) < nee_probability {
+                let direct_lighting = sample_specular_direct_lighting(ray_hit, wo, wo_tangent, TBN, i == 0u, rng);
+                let direct_lighting_brdf = evaluate_brdf(wo, direct_lighting.wi, ray_hit.world_normal, ray_hit.material);
+                let mis_weight = nee_mis_weight(direct_lighting.inverse_pdf, direct_lighting.brdf_rays_can_hit, wo_tangent, direct_lighting.wi, ray_hit, TBN);
+                if safe_positive_pdf(direct_lighting.sampling_weight) {
+                    radiance += throughput * mis_weight * direct_lighting.radiance * direct_lighting.sampling_weight * direct_lighting_brdf / nee_probability;
+                }
+            }
         }
 
         // Sample new ray direction from the GGX BRDF for next bounce
@@ -155,17 +225,95 @@ fn trace_glossy_path(pixel_id: vec2<u32>, primary_surface: ResolvedGPixel, initi
         p_bounce = ggx_vndf_pdf(wo_tangent, wi_tangent, ray_hit.material.roughness);
         throughput *= evaluate_brdf(wo, wi, N, ray_hit.material);
         if ray_hit.material.roughness > MIRROR_ROUGHNESS_THRESHOLD {
+            if !safe_positive_pdf(p_bounce) {
+                break;
+            }
             throughput /= p_bounce;
+        }
+        if !finite3(throughput) {
+            break;
         }
         path_roughness += ray_hit.material.roughness;
 
         // Russian roulette for early termination
-        let p = luminance(throughput);
-        if rand_f(rng) > p { break; }
-        throughput /= p;
+        if i >= 2u {
+            let p = clamp(max_component(throughput), 0.05, 0.95);
+            if rand_f(rng) > p { break; }
+            throughput /= p;
+        }
     }
 
     return radiance;
+}
+
+fn specular_nee_probability(throughput: vec3<f32>, roughness: f32, bounce_index: u32) -> f32 {
+    let throughput_energy = max_component(throughput);
+    let roughness_factor = clamp(roughness * 4.0, 0.2, 1.0);
+    let bounce_factor = select(0.55, 1.0, bounce_index == 0u);
+    return clamp(throughput_energy * roughness_factor * bounce_factor, 0.15, 1.0);
+}
+
+struct SpecularDirectLighting {
+    radiance: vec3<f32>,
+    wi: vec3<f32>,
+    sampling_weight: f32,
+    inverse_pdf: f32,
+    brdf_rays_can_hit: bool,
+}
+
+fn sample_specular_direct_lighting(ray_hit: ResolvedRayHitFull, wo: vec3<f32>, wo_tangent: vec3<f32>, TBN: mat3x3<f32>, reuse_tile_candidates: bool, rng: ptr<function, u32>) -> SpecularDirectLighting {
+    if reuse_tile_candidates && constants.light_tile_budget != 0u {
+        let ris_lighting = sample_specular_direct_lighting_ris(ray_hit, wo, wo_tangent, TBN, rng);
+        if safe_positive_pdf(ris_lighting.sampling_weight) {
+            return ris_lighting;
+        }
+    }
+
+    let direct_lighting = sample_random_light(ray_hit.world_position, ray_hit.world_normal, rng);
+    return SpecularDirectLighting(
+        direct_lighting.radiance,
+        direct_lighting.wi,
+        direct_lighting.inverse_pdf,
+        direct_lighting.inverse_pdf,
+        direct_lighting.brdf_rays_can_hit,
+    );
+}
+
+fn sample_specular_direct_lighting_ris(ray_hit: ResolvedRayHitFull, wo: vec3<f32>, wo_tangent: vec3<f32>, TBN: mat3x3<f32>, rng: ptr<function, u32>) -> SpecularDirectLighting {
+    var selected = SpecularDirectLighting(vec3(0.0), vec3(0.0), 0.0, 0.0, false);
+    var selected_target = 0.0;
+    var weight_sum = 0.0;
+    let candidate_weight = 1.0 / f32(SPECULAR_NEE_RIS_CANDIDATES);
+
+    for (var i = 0u; i < SPECULAR_NEE_RIS_CANDIDATES; i += 1u) {
+        let tile_sample = (rand_range_u(constants.light_tile_budget, rng) * 1024u) + rand_range_u(1024u, rng);
+        let resolved_light_sample = unpack_resolved_light_sample(light_tile_resolved_samples[tile_sample], view.exposure);
+        var light_contribution = calculate_resolved_light_contribution(resolved_light_sample, ray_hit.world_position, ray_hit.world_normal);
+        if !safe_positive_pdf(light_contribution.inverse_pdf) || all(light_contribution.radiance == vec3(0.0)) {
+            continue;
+        }
+
+        light_contribution.radiance *= trace_light_visibility(ray_hit.world_position, resolved_light_sample.world_position);
+        let direct_lighting_brdf = evaluate_brdf(wo, light_contribution.wi, ray_hit.world_normal, ray_hit.material);
+        let target_function = luminance(light_contribution.radiance * direct_lighting_brdf);
+        if !(target_function > 0.0) || !finite(target_function) {
+            continue;
+        }
+
+        let resampling_weight = candidate_weight * target_function * light_contribution.inverse_pdf;
+        weight_sum += resampling_weight;
+        if rand_f(rng) < resampling_weight / weight_sum {
+            selected = SpecularDirectLighting(light_contribution.radiance, light_contribution.wi, 0.0, light_contribution.inverse_pdf, light_contribution.brdf_rays_can_hit);
+            selected_target = target_function;
+        }
+    }
+
+    if !(selected_target > 0.0) || !finite(selected_target) || !finite(weight_sum) {
+        return SpecularDirectLighting(vec3(0.0), vec3(0.0), 0.0, 0.0, false);
+    }
+
+    selected.sampling_weight = weight_sum / selected_target;
+    return selected;
 }
 
 fn emissive_mis_weight(i: u32, initial_roughness: f32, p_bounce: f32, ray_hit: ResolvedRayHitFull) -> f32 {
@@ -185,6 +333,9 @@ fn emissive_mis_weight(i: u32, initial_roughness: f32, p_bounce: f32, ray_hit: R
 fn nee_mis_weight(inverse_p_light: f32, brdf_rays_can_hit: bool, wo_tangent: vec3<f32>, wi: vec3<f32>, ray_hit: ResolvedRayHitFull, TBN: mat3x3<f32>) -> f32 {
     if !brdf_rays_can_hit {
         return 1.0;
+    }
+    if !safe_positive_pdf(inverse_p_light) {
+        return 0.0;
     }
 
     let T = TBN[0];

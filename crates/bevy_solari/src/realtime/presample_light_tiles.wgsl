@@ -7,15 +7,24 @@ enable wgpu_ray_query;
 #import bevy_pbr::rgb9e5::{vec3_to_rgb9e5_, rgb9e5_to_vec3_}
 #import bevy_pbr::utils::{octahedral_encode, octahedral_decode}
 #import bevy_render::view::View
-#import bevy_solari::sampling::{generate_random_light_sample, LightSample, ResolvedLightSample}
+#import bevy_solari::sampling::{empty_light_sample_result, generate_random_light_sample, LightSample, ResolvedLightSample}
+#import bevy_solari::scene_bindings::light_sources
 #import bevy_solari::realtime_bindings::{light_tile_samples, light_tile_resolved_samples, view, constants, ResolvedLightSamplePacked}
 
 @compute @workgroup_size(1024, 1, 1)
 fn presample_light_tiles(@builtin(workgroup_id) workgroup_id: vec3<u32>, @builtin(local_invocation_index) sample_index: u32) {
     let tile_id = workgroup_id.x;
-    var rng = (tile_id * 5782582u) + sample_index + constants.frame_index;
+    if tile_id >= constants.light_tile_budget {
+        return;
+    }
 
-    let sample = generate_random_light_sample(&rng);
+    let rotating_tile_id = tile_id + constants.frame_number * max(constants.light_tile_budget, 1u);
+    var rng = (rotating_tile_id * 5782582u) + sample_index + constants.frame_index;
+
+    var sample = empty_light_sample_result();
+    if arrayLength(&light_sources) != 0u {
+        sample = generate_random_light_sample(&rng);
+    }
 
     let i = (tile_id * 1024u) + sample_index;
     light_tile_samples[i] = sample.light_sample;

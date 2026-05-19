@@ -1,12 +1,11 @@
 enable wgpu_ray_query;
 
-#import bevy_core_pipeline::tonemapping::tonemapping_luminance as luminance
 #import bevy_pbr::pbr_functions::calculate_F0
 #import bevy_pbr::utils::{rand_f, rand_vec2f}
 #import bevy_render::maths::{PI, orthonormalize}
 #import bevy_render::view::View
 #import bevy_solari::brdf::{evaluate_brdf, evaluate_and_sample_brdf, brdf_pdf}
-#import bevy_solari::sampling::{sample_random_light, random_emissive_light_pdf, ggx_vndf_pdf, power_heuristic}
+#import bevy_solari::sampling::{sample_random_light, random_emissive_light_pdf, ggx_vndf_pdf, power_heuristic, finite3, max_component, safe_positive_pdf}
 #import bevy_solari::scene_bindings::{trace_ray, resolve_ray_hit_full, ResolvedRayHitFull, RAY_T_MIN, RAY_T_MAX, MIRROR_ROUGHNESS_THRESHOLD}
 
 @group(1) @binding(0) var accumulation_texture: texture_storage_2d<rgba32float, read_write>;
@@ -40,6 +39,7 @@ fn pathtrace(@builtin(global_invocation_id) global_id: vec3<u32>) {
     var radiance = vec3(0.0);
     var throughput = vec3(1.0);
     var p_bounce = 0.0;
+    var bounce_index = 0u;
     loop {
         let ray = trace_ray(ray_origin, ray_direction, ray_t_min, RAY_T_MAX, RAY_FLAG_NONE);
         if ray.kind != RAY_QUERY_INTERSECTION_NONE {
@@ -61,13 +61,15 @@ fn pathtrace(@builtin(global_invocation_id) global_id: vec3<u32>) {
                 let direct_lighting = sample_random_light(ray_hit.world_position, ray_hit.world_normal, &rng);
 
                 mis_weight = 1.0;
-                if direct_lighting.brdf_rays_can_hit {
+                if direct_lighting.brdf_rays_can_hit && safe_positive_pdf(direct_lighting.inverse_pdf) {
                     let pdf_of_bounce = brdf_pdf(wo, direct_lighting.wi, ray_hit.world_normal, ray_hit.material);
                     mis_weight = power_heuristic(1.0 / direct_lighting.inverse_pdf, pdf_of_bounce);
                 }
 
                 let direct_lighting_brdf = evaluate_brdf(wo, direct_lighting.wi, ray_hit.world_normal, ray_hit.material);
-                radiance += mis_weight * throughput * direct_lighting.radiance * direct_lighting.inverse_pdf * direct_lighting_brdf;
+                if safe_positive_pdf(direct_lighting.inverse_pdf) {
+                    radiance += mis_weight * throughput * direct_lighting.radiance * direct_lighting.inverse_pdf * direct_lighting_brdf;
+                }
             }
 
             // Sample new ray direction from the material BRDF for next bounce and apply BRDF
@@ -78,11 +80,17 @@ fn pathtrace(@builtin(global_invocation_id) global_id: vec3<u32>) {
             ray_t_min = RAY_T_MIN;
             p_bounce = next_bounce.pdf;
             throughput *= next_bounce.throughput;
+            if !finite3(throughput) {
+                break;
+            }
 
             // Russian roulette for early termination
-            let p = luminance(throughput);
-            if rand_f(&rng) > p { break; }
-            throughput /= p;
+            if bounce_index >= 2u {
+                let p = clamp(max_component(throughput), 0.05, 0.95);
+                if rand_f(&rng) > p { break; }
+                throughput /= p;
+            }
+            bounce_index += 1u;
         } else { break; }
     }
 
@@ -94,4 +102,3 @@ fn pathtrace(@builtin(global_invocation_id) global_id: vec3<u32>) {
     textureStore(accumulation_texture, global_id.xy, vec4(new_color, old_color.a + 1.0));
     textureStore(view_output, global_id.xy, vec4(new_color, 1.0));
 }
-

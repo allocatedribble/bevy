@@ -17,8 +17,11 @@ pub fn extract_solari_lighting(mut main_world: ResMut<MainWorld>, mut commands: 
             entity_commands.insert((solari_lighting.clone(), SkipDeferredLighting));
             solari_lighting.reset = false;
         } else {
-            entity_commands
-                .remove::<(SolariLighting, SolariLightingResources, SkipDeferredLighting)>();
+            entity_commands.remove::<(
+                SolariLighting,
+                SolariLightingResources,
+                SkipDeferredLighting,
+            )>();
         }
     }
 }

@@ -325,7 +325,7 @@ bevy_world_serialization = ["bevy_internal/bevy_world_serialization"]
 bevy_scene = ["bevy_internal/bevy_scene"]
 
 # Provides raytraced lighting (experimental)
-bevy_solari = ["bevy_internal/bevy_solari"]
+bevy_solari = ["bevy_internal/bevy_solari", "https", "free_camera"]
 
 # Provides sprite functionality
 bevy_sprite = ["bevy_internal/bevy_sprite"]

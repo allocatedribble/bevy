@@ -24,11 +24,16 @@ const MAX_COMPACTION_VERTICES_PER_FRAME: u32 = 400_000;
 pub struct BlasManager {
     blas: HashMap<AssetId<Mesh>, Blas>,
     compaction_queue: VecDeque<(AssetId<Mesh>, u32, bool)>,
+    generation: u64,
 }
 
 impl BlasManager {
     pub fn get(&self, mesh: &AssetId<Mesh>) -> Option<&Blas> {
         self.blas.get(mesh)
+    }
+
+    pub fn generation(&self) -> u64 {
+        self.generation
     }
 }
 
@@ -45,7 +50,9 @@ pub fn prepare_raytracing_blas(
         .iter()
         .chain(extracted_meshes.modified.iter())
     {
-        blas_manager.blas.remove(asset_id);
+        if blas_manager.blas.remove(asset_id).is_some() {
+            blas_manager.generation = blas_manager.generation.wrapping_add(1);
+        }
     }
 
     if extracted_meshes.extracted.is_empty() {
@@ -65,6 +72,7 @@ pub fn prepare_raytracing_blas(
                 allocate_blas(&vertex_slice, &index_slice, asset_id, &render_device);
 
             blas_manager.blas.insert(*asset_id, blas);
+            blas_manager.generation = blas_manager.generation.wrapping_add(1);
             blas_manager
                 .compaction_queue
                 .push_back((*asset_id, blas_size.vertex_count, false));
@@ -129,6 +137,7 @@ pub fn compact_raytracing_blas(
         if blas.ready_for_compaction() {
             let compacted_blas = render_queue.compact_blas(blas);
             blas_manager.blas.insert(mesh, compacted_blas);
+            blas_manager.generation = blas_manager.generation.wrapping_add(1);
 
             vertices_compacted += vertex_count;
             continue;

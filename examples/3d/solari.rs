@@ -2,24 +2,30 @@
 
 use argh::FromArgs;
 use bevy::{
+    app::AppExit,
+    asset::RenderAssetUsages,
     camera::CameraMainTextureUsages,
     camera_controller::free_camera::{FreeCamera, FreeCameraPlugin},
     diagnostic::{Diagnostic, DiagnosticPath, DiagnosticsStore},
     gltf::GltfMaterialName,
-    image::{ImageAddressMode, ImageLoaderSettings},
+    image::{Image, ImageAddressMode, ImageLoaderSettings},
     mesh::{Indices, VertexAttributeValues},
     post_process::bloom::Bloom,
     prelude::*,
-    render::{diagnostic::RenderDiagnosticsPlugin, render_resource::TextureUsages},
+    render::{
+        diagnostic::RenderDiagnosticsPlugin,
+        render_resource::{Extent3d, TextureDimension, TextureFormat, TextureUsages},
+    },
     solari::{
         pathtracer::{Pathtracer, PathtracingPlugin},
-        prelude::{RaytracingMesh3d, SolariLighting, SolariPlugins},
+        prelude::{RaytracingMesh3d, SolariDebugMode, SolariLighting, SolariPlugins},
+        realtime::SOLARI_DEBUG_COUNTER_NAMES,
     },
     world_serialization::WorldInstanceReady,
 };
 use chacha20::ChaCha8Rng;
 use rand::{RngExt, SeedableRng};
-use std::f32::consts::PI;
+use std::{f32::consts::PI, str::FromStr};
 
 #[cfg(all(feature = "dlss", not(feature = "force_disable_dlss")))]
 use bevy::anti_alias::dlss::{
@@ -35,6 +41,42 @@ struct Args {
     /// stress test a scene with many lights.
     #[argh(switch)]
     many_lights: Option<bool>,
+    /// minimal validation scene: pica-pica, no-lights, red-emissive, rgb-emissive, mirror-wall, normal-map-glossy, edge-motion, remove-raytracing-mesh.
+    #[argh(option, default = "SolariScene::PicaPica")]
+    scene: SolariScene,
+    /// exit after this many update frames; useful for automated Solari smoke validation.
+    #[argh(option)]
+    exit_after_frames: Option<u32>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SolariScene {
+    PicaPica,
+    NoLights,
+    RedEmissive,
+    RgbEmissive,
+    MirrorWall,
+    NormalMapGlossy,
+    EdgeMotion,
+    RemoveRaytracingMesh,
+}
+
+impl FromStr for SolariScene {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "pica-pica" => Ok(Self::PicaPica),
+            "no-lights" => Ok(Self::NoLights),
+            "red-emissive" => Ok(Self::RedEmissive),
+            "rgb-emissive" => Ok(Self::RgbEmissive),
+            "mirror-wall" => Ok(Self::MirrorWall),
+            "normal-map-glossy" => Ok(Self::NormalMapGlossy),
+            "edge-motion" => Ok(Self::EdgeMotion),
+            "remove-raytracing-mesh" => Ok(Self::RemoveRaytracingMesh),
+            _ => Err("expected pica-pica, no-lights, red-emissive, rgb-emissive, mirror-wall, normal-map-glossy, edge-motion, or remove-raytracing-mesh".into()),
+        }
+    }
 }
 
 fn main() {
@@ -53,22 +95,34 @@ fn main() {
         FreeCameraPlugin,
         RenderDiagnosticsPlugin,
     ))
-    .insert_resource(args);
+    .insert_resource(args)
+    .insert_resource(SolariDebugMode::validation());
 
     if args.many_lights == Some(true) {
         app.add_systems(Startup, setup_many_lights);
-    } else {
+    } else if args.scene == SolariScene::PicaPica {
         app.add_systems(Startup, setup_pica_pica);
+    } else {
+        app.add_systems(Startup, setup_minimal_scene);
     }
 
     if args.pathtracer == Some(true) {
         app.add_plugins(PathtracingPlugin);
     } else {
-        if args.many_lights != Some(true) {
+        if args.many_lights != Some(true) && args.scene == SolariScene::PicaPica {
             app.add_systems(Update, (pause_scene, toggle_lights, patrol_path))
                 .add_systems(PostUpdate, update_control_text);
         }
+        if args.scene == SolariScene::EdgeMotion {
+            app.add_systems(Update, move_edge_camera);
+        }
+        if args.scene == SolariScene::RemoveRaytracingMesh {
+            app.add_systems(Update, remove_raytracing_mesh_at_runtime);
+        }
         app.add_systems(PostUpdate, update_performance_text);
+    }
+    if args.exit_after_frames.is_some() {
+        app.add_systems(Update, exit_after_frames);
     }
 
     app.run();
@@ -371,6 +425,318 @@ fn setup_many_lights(
     ));
 }
 
+fn setup_minimal_scene(
+    mut commands: Commands,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+    mut images: ResMut<Assets<Image>>,
+    args: Res<Args>,
+) {
+    let rasterize = args.pathtracer != Some(true);
+    let plane_mesh = meshes.add(
+        Plane3d::default()
+            .mesh()
+            .size(8.0, 8.0)
+            .build()
+            .with_generated_tangents()
+            .unwrap(),
+    );
+    let cube_mesh = meshes.add(
+        Cuboid::default()
+            .mesh()
+            .build()
+            .with_generated_tangents()
+            .unwrap(),
+    );
+    let matte = materials.add(StandardMaterial {
+        base_color: Color::srgb(0.55, 0.57, 0.60),
+        perceptual_roughness: 0.85,
+        ..default()
+    });
+    let red_emissive = materials.add(StandardMaterial {
+        base_color: Color::srgb(1.0, 0.0, 0.0),
+        emissive: LinearRgba::from(Color::linear_rgb(8000.0, 0.0, 0.0)),
+        ..default()
+    });
+    let green_emissive = materials.add(StandardMaterial {
+        base_color: Color::srgb(0.0, 1.0, 0.0),
+        emissive: LinearRgba::from(Color::linear_rgb(0.0, 8000.0, 0.0)),
+        ..default()
+    });
+    let blue_emissive = materials.add(StandardMaterial {
+        base_color: Color::srgb(0.0, 0.0, 1.0),
+        emissive: LinearRgba::from(Color::linear_rgb(0.0, 0.0, 8000.0)),
+        ..default()
+    });
+    let mirror = materials.add(StandardMaterial {
+        base_color: Color::srgb(0.92, 0.94, 0.98),
+        metallic: 1.0,
+        perceptual_roughness: 0.0,
+        ..default()
+    });
+    let normal_map = images.add(test_normal_map_image());
+    let normal_mapped_mirror = materials.add(StandardMaterial {
+        base_color: Color::srgb(0.90, 0.93, 1.0),
+        metallic: 1.0,
+        perceptual_roughness: 0.0,
+        normal_map_texture: Some(normal_map.clone()),
+        ..default()
+    });
+    let normal_mapped_glossy = materials.add(StandardMaterial {
+        base_color: Color::srgb(0.72, 0.74, 0.78),
+        metallic: 0.0,
+        perceptual_roughness: 0.32,
+        normal_map_texture: Some(normal_map),
+        ..default()
+    });
+
+    match args.scene {
+        SolariScene::NoLights => {
+            spawn_solari_mesh(
+                &mut commands,
+                plane_mesh.clone(),
+                matte.clone(),
+                Transform::default(),
+                rasterize,
+            );
+            spawn_solari_mesh(
+                &mut commands,
+                cube_mesh.clone(),
+                matte.clone(),
+                Transform::from_xyz(0.0, 0.5, 0.0).with_scale(Vec3::splat(0.75)),
+                rasterize,
+            );
+        }
+        SolariScene::RedEmissive => {
+            spawn_solari_mesh(
+                &mut commands,
+                plane_mesh.clone(),
+                matte.clone(),
+                Transform::default(),
+                rasterize,
+            );
+            spawn_solari_mesh(
+                &mut commands,
+                cube_mesh.clone(),
+                red_emissive.clone(),
+                Transform::from_xyz(0.0, 1.2, -1.0).with_scale(Vec3::splat(0.45)),
+                rasterize,
+            );
+        }
+        SolariScene::RgbEmissive => {
+            spawn_solari_mesh(
+                &mut commands,
+                plane_mesh.clone(),
+                matte.clone(),
+                Transform::default(),
+                rasterize,
+            );
+            for (x, material) in [
+                (-1.2, red_emissive.clone()),
+                (0.0, green_emissive.clone()),
+                (1.2, blue_emissive.clone()),
+            ] {
+                spawn_solari_mesh(
+                    &mut commands,
+                    cube_mesh.clone(),
+                    material,
+                    Transform::from_xyz(x, 1.1, -1.2).with_scale(Vec3::splat(0.35)),
+                    rasterize,
+                );
+            }
+        }
+        SolariScene::MirrorWall => {
+            spawn_solari_mesh(
+                &mut commands,
+                cube_mesh.clone(),
+                mirror.clone(),
+                Transform::from_xyz(0.0, 1.0, 0.0).with_scale(Vec3::new(0.08, 2.0, 3.0)),
+                rasterize,
+            );
+        }
+        SolariScene::NormalMapGlossy => {
+            spawn_solari_mesh(
+                &mut commands,
+                plane_mesh.clone(),
+                normal_mapped_glossy,
+                Transform::default(),
+                rasterize,
+            );
+            spawn_solari_mesh(
+                &mut commands,
+                cube_mesh.clone(),
+                normal_mapped_mirror,
+                Transform::from_xyz(-0.9, 1.0, -0.6).with_scale(Vec3::new(0.08, 1.4, 1.6)),
+                rasterize,
+            );
+            for (x, material) in [
+                (-1.6, red_emissive.clone()),
+                (0.0, green_emissive.clone()),
+                (1.6, blue_emissive.clone()),
+            ] {
+                spawn_solari_mesh(
+                    &mut commands,
+                    cube_mesh.clone(),
+                    material,
+                    Transform::from_xyz(x, 1.5, -1.8).with_scale(Vec3::splat(0.25)),
+                    rasterize,
+                );
+            }
+        }
+        SolariScene::EdgeMotion => {
+            spawn_solari_mesh(
+                &mut commands,
+                plane_mesh.clone(),
+                matte.clone(),
+                Transform::default(),
+                rasterize,
+            );
+            spawn_solari_mesh(
+                &mut commands,
+                cube_mesh.clone(),
+                red_emissive.clone(),
+                Transform::from_xyz(2.9, 1.0, -1.2).with_scale(Vec3::splat(0.35)),
+                rasterize,
+            );
+        }
+        SolariScene::RemoveRaytracingMesh => {
+            spawn_solari_mesh(
+                &mut commands,
+                plane_mesh.clone(),
+                matte.clone(),
+                Transform::default(),
+                rasterize,
+            );
+            let entity = spawn_solari_mesh(
+                &mut commands,
+                cube_mesh.clone(),
+                red_emissive.clone(),
+                Transform::from_xyz(0.0, 1.0, -1.0).with_scale(Vec3::splat(0.45)),
+                rasterize,
+            );
+            commands.entity(entity).insert(RuntimeRaytracingRemoval);
+        }
+        SolariScene::PicaPica => unreachable!(),
+    }
+
+    let mut camera = commands.spawn((
+        Camera3d::default(),
+        Camera {
+            clear_color: ClearColorConfig::Custom(Color::BLACK),
+            ..default()
+        },
+        FreeCamera {
+            walk_speed: 2.0,
+            run_speed: 6.0,
+            ..Default::default()
+        },
+        Transform::from_xyz(0.0, 1.4, 4.2).looking_at(Vec3::new(0.0, 0.7, 0.0), Vec3::Y),
+        CameraMainTextureUsages::default().with(TextureUsages::STORAGE_BINDING),
+        Msaa::Off,
+    ));
+    if args.scene == SolariScene::EdgeMotion {
+        camera.insert(EdgeMotionCamera);
+    }
+    if args.pathtracer == Some(true) {
+        camera.insert(Pathtracer::default());
+    } else {
+        camera.insert(SolariLighting::default());
+    }
+
+    commands.spawn((
+        Node {
+            position_type: PositionType::Absolute,
+            right: px(0.0),
+            padding: px(4.0).all(),
+            border_radius: BorderRadius::bottom_left(px(4.0)),
+            ..default()
+        },
+        BackgroundColor(Color::srgba(0.10, 0.10, 0.10, 0.8)),
+        children![(
+            PerformanceText,
+            Text::default(),
+            TextFont {
+                font_size: FontSize::Px(8.0),
+                ..default()
+            },
+        )],
+    ));
+}
+
+fn test_normal_map_image() -> Image {
+    let mut image = Image::new_fill(
+        Extent3d {
+            width: 2,
+            height: 2,
+            ..default()
+        },
+        TextureDimension::D2,
+        &[
+            255, 128, 255, 255, 128, 255, 255, 255, 0, 128, 255, 255, 128, 0, 255, 255,
+        ],
+        TextureFormat::Rgba8Unorm,
+        RenderAssetUsages::default(),
+    );
+    image.texture_descriptor.usage = TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST;
+    image
+}
+
+fn spawn_solari_mesh(
+    commands: &mut Commands,
+    mesh: Handle<Mesh>,
+    material: Handle<StandardMaterial>,
+    transform: Transform,
+    rasterize: bool,
+) -> Entity {
+    let mut entity = commands.spawn((
+        RaytracingMesh3d(mesh.clone()),
+        MeshMaterial3d(material),
+        transform,
+    ));
+    if rasterize {
+        entity.insert(Mesh3d(mesh));
+    }
+    entity.id()
+}
+
+#[derive(Component)]
+struct EdgeMotionCamera;
+
+fn move_edge_camera(mut camera: Query<&mut Transform, With<EdgeMotionCamera>>, time: Res<Time>) {
+    for mut transform in &mut camera {
+        let x = 0.65 * (time.elapsed_secs() * 1.7).sin();
+        *transform =
+            Transform::from_xyz(x, 1.4, 4.2).looking_at(Vec3::new(2.4, 0.9, -1.0), Vec3::Y);
+    }
+}
+
+#[derive(Component)]
+struct RuntimeRaytracingRemoval;
+
+fn remove_raytracing_mesh_at_runtime(
+    mut commands: Commands,
+    time: Res<Time>,
+    mut removed: Local<bool>,
+    targets: Query<Entity, With<RuntimeRaytracingRemoval>>,
+) {
+    if *removed || time.elapsed_secs() < 0.5 {
+        return;
+    }
+    for entity in &targets {
+        commands.entity(entity).remove::<RaytracingMesh3d>();
+    }
+    *removed = true;
+}
+
+fn exit_after_frames(args: Res<Args>, mut frames: Local<u32>, mut exit: MessageWriter<AppExit>) {
+    if let Some(limit) = args.exit_after_frames {
+        *frames += 1;
+        if *frames >= limit {
+            exit.write(AppExit::Success);
+        }
+    }
+}
+
 fn add_raytracing_meshes_on_scene_load(
     scene_ready: On<WorldInstanceReady>,
     children: Query<&Children>,
@@ -624,5 +990,17 @@ fn update_performance_text(
             world_cache_active_cells_count as u32,
             (world_cache_active_cells_count * 100.0) / (2u64.pow(20) as f64)
         ));
+    }
+
+    let mut wrote_debug_header = false;
+    for name in SOLARI_DEBUG_COUNTER_NAMES {
+        let path = DiagnosticPath::from_components(["render", "solari_lighting", "debug", name]);
+        if let Some(value) = diagnostics.get(&path).and_then(Diagnostic::value) {
+            if !wrote_debug_header {
+                text.push_str("\n\nSolari debug");
+                wrote_debug_header = true;
+            }
+            text.push_str(&format!("\n{name:31} {}", value as u32));
+        }
     }
 }

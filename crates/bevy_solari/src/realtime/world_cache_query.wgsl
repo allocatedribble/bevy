@@ -4,6 +4,7 @@ enable wgpu_ray_query;
 
 #import bevy_pbr::utils::{rand_f, rand_vec2f}
 #import bevy_render::maths::orthonormalize
+#import bevy_solari::solari_debug::solari_debug_count_world_cache_probe_wrap
 #import bevy_solari::realtime_bindings::{
     world_cache_life,
     world_cache_checksums,
@@ -11,9 +12,9 @@ enable wgpu_ray_query;
     world_cache_geometry_data,
     world_cache_luminance_deltas,
     world_cache_a,
-    world_cache_b,
     world_cache_active_cell_indices,
     world_cache_active_cells_count,
+    constants,
     WorldCacheGeometryData,
 }
 
@@ -39,8 +40,7 @@ const WORLD_CACHE_POSITION_LOD_SCALE: f32 = 15.0;
 /// Marker value for an empty cell
 const WORLD_CACHE_EMPTY_CELL: u32 = 0u;
 
-#ifndef WORLD_CACHE_NON_ATOMIC_LIFE_BUFFER
-fn query_world_cache(world_position_in: vec3<f32>, world_normal: vec3<f32>, view_position: vec3<f32>, ray_t: f32, cell_lifetime: u32, rng: ptr<function, u32>) -> vec3<f32> {
+fn query_world_cache(world_position_in: vec3<f32>, world_normal: vec3<f32>, view_position: vec3<f32>, ray_t: f32, cell_lifetime: u32, append_active: bool, rng: ptr<function, u32>) -> vec3<f32> {
     var world_position = world_position_in;
     var cell_size = get_cell_size(world_position, view_position, rng);
 
@@ -66,34 +66,83 @@ fn query_world_cache(world_position_in: vec3<f32>, world_normal: vec3<f32>, view
     let checksum = compute_checksum(world_position_quantized, world_normal_quantized);
 
     for (var i = 0u; i < WORLD_CACHE_MAX_SEARCH_STEPS; i++) {
-        let existing_checksum = atomicCompareExchangeWeak(&world_cache_checksums[key], WORLD_CACHE_EMPTY_CELL, checksum).old_value;
+        let r = atomicCompareExchangeWeak(&world_cache_checksums[key], WORLD_CACHE_EMPTY_CELL, checksum);
 
-        // Cell already exists or is empty - reset lifetime
-        if existing_checksum == checksum || existing_checksum == WORLD_CACHE_EMPTY_CELL {
-#ifndef WORLD_CACHE_QUERY_ATOMIC_MAX_LIFETIME
-            atomicStore(&world_cache_life[key], cell_lifetime);
-#else
-            atomicMax(&world_cache_life[key], cell_lifetime);
-#endif
-        }
+        if r.old_value == checksum {
+            if expire_world_cache_cell_if_stale(key, checksum, cell_lifetime) {
+                continue;
+            }
 
-        if existing_checksum == checksum {
             // Cache entry already exists - get radiance
+            refresh_world_cache_lifetime(key, append_active);
             return world_cache_radiance[key].rgb;
-        } else if existing_checksum == WORLD_CACHE_EMPTY_CELL {
-            // Cell is empty - initialize it
-            world_cache_geometry_data[key].world_position = world_position;
-            world_cache_geometry_data[key].world_normal = world_normal;
-            return vec3(0.0);
-        } else {
-            // Collision - linear probe to next entry
-            key += 1u;
         }
+
+        if r.old_value == WORLD_CACHE_EMPTY_CELL {
+            if r.exchanged {
+                // Cell is empty and this invocation claimed it.
+                world_cache_geometry_data[key].world_position = world_position;
+                world_cache_geometry_data[key].world_normal = world_normal;
+                world_cache_radiance[key] = vec4(0.0);
+                world_cache_luminance_deltas[key] = 0.0;
+                refresh_world_cache_lifetime(key, append_active);
+                return vec3(0.0);
+            }
+
+            // Weak CAS can fail spuriously; retry the same key within the bounded search budget.
+            continue;
+        }
+
+        if expire_world_cache_cell_if_stale(key, r.old_value, cell_lifetime) {
+            continue;
+        }
+
+        // Collision - linear probe to next entry, wrapping inside the table.
+        let next_key = wrap_key(key + 1u);
+        if next_key < key {
+            solari_debug_count_world_cache_probe_wrap();
+        }
+        key = next_key;
     }
 
     return vec3(0.0);
 }
-#endif
+
+fn refresh_world_cache_lifetime(key: u32, append_active: bool) {
+    let epoch = world_cache_frame_epoch();
+    atomicStore(&world_cache_life[key], epoch);
+    if !append_active {
+        return;
+    }
+
+    let previous_epoch = atomicExchange(&world_cache_a[key], epoch);
+    if previous_epoch != epoch {
+        let active_index = atomicAdd(&world_cache_active_cells_count, 1u);
+        if active_index < #{WORLD_CACHE_SIZE} {
+            world_cache_active_cell_indices[active_index] = key;
+        }
+    }
+}
+
+fn expire_world_cache_cell_if_stale(key: u32, checksum: u32, cell_lifetime: u32) -> bool {
+    let last_seen_frame = atomicLoad(&world_cache_life[key]);
+    if last_seen_frame != 0u && world_cache_frame_epoch() - last_seen_frame <= cell_lifetime {
+        return false;
+    }
+
+    let r = atomicCompareExchangeWeak(&world_cache_checksums[key], checksum, WORLD_CACHE_EMPTY_CELL);
+    if r.old_value == checksum && r.exchanged {
+        atomicStore(&world_cache_life[key], 0u);
+        atomicStore(&world_cache_a[key], 0u);
+        world_cache_radiance[key] = vec4(0.0);
+        world_cache_luminance_deltas[key] = 0.0;
+    }
+    return r.old_value == checksum;
+}
+
+fn world_cache_frame_epoch() -> u32 {
+    return constants.frame_number + 1u;
+}
 
 fn get_cell_size(world_position: vec3<f32>, view_position: vec3<f32>, rng: ptr<function, u32>) -> f32 {
     let camera_distance = distance(view_position, world_position) / WORLD_CACHE_POSITION_LOD_SCALE;

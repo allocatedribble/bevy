@@ -6,6 +6,9 @@ enable wgpu_ray_query;
 #import bevy_pbr::utils::{rand_f, rand_vec2f, rand_u, rand_range_u}
 #import bevy_render::maths::{PI_2, orthonormalize}
 #import bevy_solari::scene_bindings::{trace_ray, RAY_T_MIN, RAY_T_MAX, light_sources, directional_lights, LightSource, LIGHT_SOURCE_KIND_DIRECTIONAL, resolve_triangle_data_full, ResolvedRayHitFull, MIRROR_ROUGHNESS_THRESHOLD}
+#ifdef SOLARI_DEBUG_COUNTERS
+#import bevy_solari::solari_debug::{solari_debug_count_empty_light_table_sample, solari_debug_count_zero_distance_visibility}
+#endif
 
 fn power_heuristic(f: f32, g: f32) -> f32 {
     return balance_heuristic(f * f, g * g);
@@ -19,6 +22,39 @@ fn balance_heuristic(f: f32, g: f32) -> f32 {
     return max(0.0, 1.0 / (1.0 + (g / f)));
 }
 
+fn isinf(x: f32) -> bool {
+    return (bitcast<u32>(x) & 0x7fffffffu) == 0x7f800000u;
+}
+
+fn isnan(x: f32) -> bool {
+    return (bitcast<u32>(x) & 0x7fffffffu) > 0x7f800000u;
+}
+
+fn finite(x: f32) -> bool {
+    return (bitcast<u32>(x) & 0x7fffffffu) < 0x7f800000u;
+}
+
+fn finite3(v: vec3<f32>) -> bool {
+    let bits = bitcast<vec3<u32>>(v) & vec3(0x7fffffffu);
+    return all(bits < vec3(0x7f800000u));
+}
+
+fn max_component(v: vec3<f32>) -> f32 {
+    return max(v.x, max(v.y, v.z));
+}
+
+fn safe_normalize_or_zero(v: vec3<f32>) -> vec3<f32> {
+    let len2 = dot(v, v);
+    if !(len2 > 0.0) || !finite(len2) {
+        return vec3(0.0);
+    }
+    return v * inverseSqrt(len2);
+}
+
+fn safe_positive_pdf(pdf: f32) -> bool {
+    return pdf > 0.0 && finite(pdf);
+}
+
 // https://gpuopen.com/download/Bounded_VNDF_Sampling_for_Smith-GGX_Reflections.pdf (Listing 1)
 // Result is invalid when output.z <= 0.0, and must be discarded
 fn sample_ggx_vndf(wi_tangent: vec3<f32>, roughness: f32, rng: ptr<function, u32>) -> vec3<f32> {
@@ -29,7 +65,10 @@ fn sample_ggx_vndf(wi_tangent: vec3<f32>, roughness: f32, rng: ptr<function, u32
 
     let i = wi_tangent;
     let rand = rand_vec2f(rng);
-    let i_std = normalize(vec3(i.xy * roughness, i.z));
+    let i_std = safe_normalize_or_zero(vec3(i.xy * roughness, i.z));
+    if all(i_std == vec3(0.0)) {
+        return vec3(0.0);
+    }
     let phi = PI_2 * rand.x;
     let a = roughness;
     let s = 1.0 + length(vec2(i.xy));
@@ -41,7 +80,10 @@ fn sample_ggx_vndf(wi_tangent: vec3<f32>, roughness: f32, rng: ptr<function, u32
     let sin_theta = sqrt(saturate(1.0 - z * z));
     let o_std = vec3(sin_theta * cos(phi), sin_theta * sin(phi), z);
     let m_std = i_std + o_std;
-    let m = normalize(vec3(m_std.xy * roughness, m_std.z));
+    let m = safe_normalize_or_zero(vec3(m_std.xy * roughness, m_std.z));
+    if all(m == vec3(0.0)) {
+        return vec3(0.0);
+    }
     return 2.0 * dot(i, m) * m - i;
 }
 
@@ -63,7 +105,10 @@ fn ggx_vndf_pdf(wi_tangent: vec3<f32>, wo_tangent: vec3<f32>, roughness: f32) ->
 
     let i = wi_tangent;
     let o = wo_tangent;
-    let m = normalize(i + o);
+    let m = safe_normalize_or_zero(i + o);
+    if all(m == vec3(0.0)) {
+        return 0.0;
+    }
     let ndf = D_GGX(roughness, saturate(m.z));
     let ai = roughness * i.xy;
     let len2 = dot(ai, ai);
@@ -81,10 +126,6 @@ fn ggx_vndf_pdf(wi_tangent: vec3<f32>, wo_tangent: vec3<f32>, roughness: f32) ->
     }
 
     return select(pdf, 0.0, isnan(pdf));
-}
-
-fn isnan(x: f32) -> bool {
-    return (bitcast<u32>(x) & 0x7fffffffu) > 0x7f800000u;
 }
 
 const NULL_LIGHT_ID = 0xFFFFFFFFu;
@@ -120,18 +161,34 @@ struct GenerateRandomLightSampleResult {
 
 fn sample_random_light(ray_origin: vec3<f32>, origin_world_normal: vec3<f32>, rng: ptr<function, u32>) -> LightContribution {
     let sample = generate_random_light_sample(rng);
+    if sample.light_sample.light_id == NULL_LIGHT_ID {
+        return LightContribution(vec3(0.0), 0.0, vec3(0.0), false);
+    }
     var light_contribution = calculate_resolved_light_contribution(sample.resolved_light_sample, ray_origin, origin_world_normal);
+    if light_contribution.inverse_pdf == 0.0 || all(light_contribution.radiance == vec3(0.0)) {
+        return light_contribution;
+    }
     light_contribution.radiance *= trace_light_visibility(ray_origin, sample.resolved_light_sample.world_position);
     return light_contribution;
 }
 
 fn random_emissive_light_pdf(hit: ResolvedRayHitFull) -> f32 {
     let light_count = arrayLength(&light_sources);
+    if light_count == 0u || hit.triangle_count == 0u || !safe_positive_pdf(hit.triangle_area) {
+        return 0.0;
+    }
     return 1.0 / (f32(light_count) * f32(hit.triangle_count) * hit.triangle_area);
 }
 
 fn generate_random_light_sample(rng: ptr<function, u32>) -> GenerateRandomLightSampleResult {
     let light_count = arrayLength(&light_sources);
+    if light_count == 0u {
+#ifdef SOLARI_DEBUG_COUNTERS
+        solari_debug_count_empty_light_table_sample();
+#endif
+        return empty_light_sample_result();
+    }
+
     let light_id = rand_range_u(light_count, rng);
 
     let light_source = light_sources[light_id];
@@ -139,6 +196,9 @@ fn generate_random_light_sample(rng: ptr<function, u32>) -> GenerateRandomLightS
     var triangle_id = 0u;
     if light_source.kind != LIGHT_SOURCE_KIND_DIRECTIONAL {
         let triangle_count = light_source.kind >> 1u;
+        if triangle_count == 0u {
+            return empty_light_sample_result();
+        }
         triangle_id = rand_range_u(triangle_count, rng);
     }
 
@@ -151,7 +211,19 @@ fn generate_random_light_sample(rng: ptr<function, u32>) -> GenerateRandomLightS
     return GenerateRandomLightSampleResult(light_sample, resolved_light_sample);
 }
 
+fn empty_light_sample_result() -> GenerateRandomLightSampleResult {
+    return GenerateRandomLightSampleResult(LightSample(NULL_LIGHT_ID, 0u), empty_resolved_light_sample());
+}
+
+fn empty_resolved_light_sample() -> ResolvedLightSample {
+    return ResolvedLightSample(vec4(0.0), vec3(0.0), vec3(0.0), 0.0);
+}
+
 fn resolve_light_sample(light_sample: LightSample, light_source: LightSource) -> ResolvedLightSample {
+    if light_sample.light_id == NULL_LIGHT_ID {
+        return empty_resolved_light_sample();
+    }
+
     if light_source.kind == LIGHT_SOURCE_KIND_DIRECTIONAL {
         let directional_light = directional_lights[light_source.id];
 
@@ -182,8 +254,11 @@ fn resolve_light_sample(light_sample: LightSample, light_source: LightSource) ->
 } else {
         let triangle_count = light_source.kind >> 1u;
         let triangle_id = light_sample.light_id & 0xFFFFu;
+        if triangle_count == 0u || triangle_id >= triangle_count {
+            return empty_resolved_light_sample();
+        }
         let barycentrics = triangle_barycentrics(light_sample.seed);
-        let triangle_data = resolve_triangle_data_full(light_source.id, triangle_id, barycentrics);
+        let triangle_data = resolve_triangle_data_full(light_source.id, triangle_id, barycentrics, 0.0);
 
         return ResolvedLightSample(
             vec4(triangle_data.world_position, 1.0),
@@ -195,19 +270,32 @@ fn resolve_light_sample(light_sample: LightSample, light_source: LightSource) ->
 }
 
 fn calculate_resolved_light_contribution(resolved_light_sample: ResolvedLightSample, ray_origin: vec3<f32>, origin_world_normal: vec3<f32>) -> LightContribution {
+    if !safe_positive_pdf(resolved_light_sample.inverse_pdf) || !finite3(resolved_light_sample.radiance) || all(resolved_light_sample.radiance == vec3(0.0)) {
+        return LightContribution(vec3(0.0), 0.0, vec3(0.0), false);
+    }
+
     let ray = resolved_light_sample.world_position.xyz - (resolved_light_sample.world_position.w * ray_origin);
     let light_distance = length(ray);
+    if !(light_distance > RAY_T_MIN) || !finite(light_distance) {
+        return LightContribution(vec3(0.0), 0.0, vec3(0.0), false);
+    }
     let wi = ray / light_distance;
 
     let cos_theta_light = saturate(dot(-wi, resolved_light_sample.world_normal));
     let light_distance_squared = light_distance * light_distance;
 
     let radiance = resolved_light_sample.radiance * (cos_theta_light / light_distance_squared);
+    if !finite3(radiance) {
+        return LightContribution(vec3(0.0), 0.0, vec3(0.0), false);
+    }
 
     return LightContribution(radiance, resolved_light_sample.inverse_pdf, wi, resolved_light_sample.world_position.w == 1.0);
 }
 
 fn resolve_and_calculate_light_contribution(light_sample: LightSample, ray_origin: vec3<f32>, origin_world_normal: vec3<f32>) -> LightContributionNoPdf {
+    if light_sample.light_id == NULL_LIGHT_ID || (light_sample.light_id >> 16u) >= arrayLength(&light_sources) {
+        return LightContributionNoPdf(vec3(0.0), vec3(0.0));
+    }
     let resolved_light_sample = resolve_light_sample(light_sample, light_sources[light_sample.light_id >> 16u]);
     let light_contribution = calculate_resolved_light_contribution(resolved_light_sample, ray_origin, origin_world_normal);
     return LightContributionNoPdf(light_contribution.radiance, light_contribution.wi);
@@ -220,10 +308,19 @@ fn trace_light_visibility(ray_origin: vec3<f32>, light_sample_world_position: ve
     if light_sample_world_position.w == 1.0 {
         let ray = ray_direction - ray_origin;
         let dist = length(ray);
+        if !(dist > RAY_T_MIN) || !finite(dist) {
+#ifdef SOLARI_DEBUG_COUNTERS
+            solari_debug_count_zero_distance_visibility();
+#endif
+            return 0.0;
+        }
         ray_direction = ray / dist;
         ray_t_max = dist - RAY_T_MIN;
     }
 
+    if !finite3(ray_direction) || dot(ray_direction, ray_direction) <= 0.0 {
+        return 0.0;
+    }
     if ray_t_max < RAY_T_MIN { return 0.0; }
 
     let ray_hit = trace_ray(ray_origin, ray_direction, RAY_T_MIN, ray_t_max, RAY_FLAG_TERMINATE_ON_FIRST_HIT);
@@ -233,6 +330,12 @@ fn trace_light_visibility(ray_origin: vec3<f32>, light_sample_world_position: ve
 fn trace_point_visibility(ray_origin: vec3<f32>, point: vec3<f32>) -> f32 {
     let ray = point - ray_origin;
     let dist = length(ray);
+    if !(dist > RAY_T_MIN) || !finite(dist) {
+#ifdef SOLARI_DEBUG_COUNTERS
+        solari_debug_count_zero_distance_visibility();
+#endif
+        return 0.0;
+    }
     let ray_direction = ray / dist;
 
     let ray_t_max = dist - RAY_T_MIN;
