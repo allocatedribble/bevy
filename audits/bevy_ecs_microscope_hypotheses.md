@@ -93,12 +93,13 @@ Claim: mutexes, bitset scans, condition checks, and task spawning are reasonable
 
 Current evidence:
 
-- Pass 1 showed 10k no-op schedules:
-  - single-threaded: `11.498 us .. 12.021 us`
-  - multi-threaded: `787.02 us .. 800.47 us`
-- Pass 5 measured 10k no-op systems:
-  - single-threaded run: `124.39 us .. 176.17 us`
-  - multi-threaded run: `6.1867 ms .. 7.2330 ms`
+- Pass 1 showed no-op schedule runs up to 1,000 systems:
+  - single-threaded, 1,000 systems: `11.498 us .. 12.021 us`, about `11.5 ns .. 12.0 ns` per system
+  - multi-threaded, 1,000 systems: `787.02 us .. 800.47 us`, about `787 ns .. 800 ns` per system
+- Pass 5 extended that no-op pressure to 10,000 systems:
+  - single-threaded, 10,000 systems: `124.39 us .. 176.17 us`, about `12.4 ns .. 17.6 ns` per system
+  - multi-threaded, 10,000 systems: `6.1867 ms .. 7.2330 ms`, about `619 ns .. 723 ns` per system
+- Interpretation: this is not evidence that ECS became 10x slower per system. The previous ledger compared 1,000-system Pass 1 numbers against 10,000-system Pass 5 numbers. Total time rises roughly with system count; per-system multi-threaded no-op overhead is actually slightly lower in the 10k Pass 5 run, while single-threaded overhead is in the same range with a wider interval.
 - Pass 5 measured schedule build pressure:
   - 10k no-op single-threaded build: `2.0927 s .. 2.4136 s`
   - 10k no-op multi-threaded build: `2.2364 s .. 2.3251 s`
