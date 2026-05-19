@@ -110,7 +110,7 @@ impl GlobalTrigger {
             // - `trigger_context`'s event_key matches `E`, enforced by the call to `trigger_internal`
             // - this abides by the nuances defined in the `Trigger` safety docs
             unsafe {
-                crate::audit::observer_dispatch();
+                crate::audit::observer_global_dispatch();
                 (runner)(
                     world.reborrow(),
                     *observer,
@@ -195,7 +195,7 @@ pub unsafe fn trigger_entity_internal(
         // - `trigger` is a matching trigger type, enforced by the call to `trigger_entity_internal`
         // - `trigger_context`'s event_key matches `E`, enforced by the call to `trigger_entity_internal`
         unsafe {
-            crate::audit::observer_dispatch();
+            crate::audit::observer_global_dispatch();
             (runner)(
                 world.reborrow(),
                 *observer,
@@ -214,7 +214,7 @@ pub unsafe fn trigger_entity_internal(
             // - `trigger` is a matching trigger type, enforced by the call to `trigger_entity_internal`
             // - `trigger_context`'s event_key matches `E`, enforced by the call to `trigger_entity_internal`
             unsafe {
-                crate::audit::observer_dispatch();
+                crate::audit::observer_entity_dispatch();
                 (runner)(
                     world.reborrow(),
                     *observer,
@@ -490,7 +490,7 @@ impl<'a> EntityComponentsTrigger<'a> {
                     // - `trigger` is a matching trigger type, enforced by the call to `trigger_internal`
                     // - `trigger_context`'s event_key matches `E`, enforced by the call to `trigger_internal`
                     unsafe {
-                        crate::audit::observer_dispatch();
+                        crate::audit::observer_component_dispatch();
                         (runner)(
                             world.reborrow(),
                             *observer,
@@ -512,7 +512,7 @@ impl<'a> EntityComponentsTrigger<'a> {
                         // - `trigger` is a matching trigger type, enforced by the call to `trigger_internal`
                         // - `trigger_context`'s event_key matches `E`, enforced by the call to `trigger_internal`
                         unsafe {
-                            crate::audit::observer_dispatch();
+                            crate::audit::observer_entity_component_dispatch();
                             (runner)(
                                 world.reborrow(),
                                 *observer,

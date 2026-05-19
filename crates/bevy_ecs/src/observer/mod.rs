@@ -124,7 +124,14 @@ impl World {
     ) -> Option<(DeferredWorld<'_>, &CachedObservers)> {
         let world_cell = self.as_unsafe_world_cell();
         let observers = world_cell.observers();
-        let observers = observers.try_get_observers(event_key)?;
+        let Some(observers) = observers.try_get_observers(event_key) else {
+            crate::audit::observer_no_observers();
+            return None;
+        };
+        if observers.is_empty() {
+            crate::audit::observer_no_observers();
+            return None;
+        }
         // SAFETY: The caller guarantees the returned `DeferredWorld` will not
         // be used to access observer storage (which `observers` borrows).
         Some((unsafe { world_cell.into_deferred() }, observers))
@@ -174,7 +181,7 @@ impl World {
             // - `observers` come from `world` and correspond to `event_key`
             // - caller guarantees `event_data` and `trigger_data` are valid
             unsafe {
-                crate::audit::observer_dispatch();
+                crate::audit::observer_global_dispatch();
                 (runner)(
                     world.reborrow(),
                     *observer,
@@ -288,7 +295,7 @@ impl World {
                 for (observer, runner) in component_observers.global_observers() {
                     // SAFETY: same as above, caller guarantees data validity
                     unsafe {
-                        crate::audit::observer_dispatch();
+                        crate::audit::observer_component_dispatch();
                         (runner)(
                             world.reborrow(),
                             *observer,
@@ -306,7 +313,7 @@ impl World {
                     for (observer, runner) in map {
                         // SAFETY: same as above, caller guarantees data validity
                         unsafe {
-                            crate::audit::observer_dispatch();
+                            crate::audit::observer_entity_component_dispatch();
                             (runner)(
                                 world.reborrow(),
                                 *observer,
@@ -446,6 +453,7 @@ impl World {
                     }
                 }
             }
+            observers.remove_empty_cache(event_key);
         }
     }
 }
@@ -493,6 +501,9 @@ mod tests {
         counter: usize,
     }
 
+    #[derive(Event)]
+    struct EventB;
+
     #[derive(Resource, Default)]
     struct Order(Vec<&'static str>);
 
@@ -506,6 +517,21 @@ mod tests {
     #[derive(Component, EntityEvent)]
     #[entity_event(propagate, auto_propagate)]
     struct EventPropagating(Entity);
+
+    #[derive(Resource)]
+    struct ObserverToDespawn(Entity);
+
+    #[derive(Resource, Default)]
+    struct ObserverAuditCounts {
+        remover: usize,
+        victim: usize,
+        adder: usize,
+        late: usize,
+        recursive_same: usize,
+        recursive_a: usize,
+        recursive_b: usize,
+        duplicate: usize,
+    }
 
     #[test]
     fn observer_order_spawn_despawn() {
@@ -861,6 +887,180 @@ mod tests {
         );
         assert_eq!(2222211, world.resource::<R>().0);
         world.resource_mut::<R>().0 = 0;
+    }
+
+    #[test]
+    fn observer_despawns_itself_during_dispatch() {
+        let mut world = World::new();
+        world.init_resource::<Order>();
+
+        let observer = world
+            .add_observer(
+                |_: On<EventA>,
+                 observer: Res<ObserverToDespawn>,
+                 mut order: ResMut<Order>,
+                 mut commands: Commands| {
+                    order.observed("self");
+                    commands.entity(observer.0).try_despawn();
+                },
+            )
+            .id();
+        world.insert_resource(ObserverToDespawn(observer));
+
+        world.trigger(EventA);
+        world.flush();
+        world.trigger(EventA);
+        world.flush();
+
+        assert_eq!(vec!["self"], world.resource::<Order>().0);
+        assert!(world.get_entity(observer).is_err());
+    }
+
+    #[test]
+    fn observer_despawns_another_observer_during_dispatch() {
+        let mut world = World::new();
+        world.init_resource::<ObserverAuditCounts>();
+
+        let victim = world
+            .add_observer(|_: On<EventA>, mut counts: ResMut<ObserverAuditCounts>| {
+                counts.victim += 1;
+            })
+            .id();
+        world.insert_resource(ObserverToDespawn(victim));
+        world.add_observer(
+            |_: On<EventA>,
+             observer: Res<ObserverToDespawn>,
+             mut counts: ResMut<ObserverAuditCounts>,
+             mut commands: Commands| {
+                counts.remover += 1;
+                commands.entity(observer.0).try_despawn();
+            },
+        );
+
+        world.trigger(EventA);
+        world.flush();
+        world.trigger(EventA);
+        world.flush();
+
+        let counts = world.resource::<ObserverAuditCounts>();
+        assert_eq!(2, counts.remover);
+        assert_eq!(1, counts.victim);
+        assert!(world.get_entity(victim).is_err());
+    }
+
+    #[test]
+    fn observer_added_during_dispatch_waits_until_next_trigger() {
+        #[derive(Resource, Default)]
+        struct AddedLateObserver(bool);
+
+        let mut world = World::new();
+        world.init_resource::<ObserverAuditCounts>();
+        world.init_resource::<AddedLateObserver>();
+
+        world.add_observer(
+            |_: On<EventA>,
+             mut once: ResMut<AddedLateObserver>,
+             mut counts: ResMut<ObserverAuditCounts>,
+             mut commands: Commands| {
+                counts.adder += 1;
+                if !once.0 {
+                    once.0 = true;
+                    commands.queue(|world: &mut World| {
+                        world.add_observer(
+                            |_: On<EventA>, mut counts: ResMut<ObserverAuditCounts>| {
+                                counts.late += 1;
+                            },
+                        );
+                    });
+                }
+            },
+        );
+
+        world.trigger(EventA);
+        world.flush();
+        {
+            let counts = world.resource::<ObserverAuditCounts>();
+            assert_eq!(1, counts.adder);
+            assert_eq!(0, counts.late);
+        }
+
+        world.trigger(EventA);
+        world.flush();
+        let counts = world.resource::<ObserverAuditCounts>();
+        assert_eq!(2, counts.adder);
+        assert_eq!(1, counts.late);
+    }
+
+    #[test]
+    fn observer_can_trigger_same_event_recursively() {
+        let mut world = World::new();
+        world.init_resource::<ObserverAuditCounts>();
+
+        world.add_observer(
+            |_: On<EventA>, mut counts: ResMut<ObserverAuditCounts>, mut commands: Commands| {
+                counts.recursive_same += 1;
+                if counts.recursive_same == 1 {
+                    commands.trigger(EventA);
+                }
+            },
+        );
+
+        world.trigger(EventA);
+        world.flush();
+
+        assert_eq!(2, world.resource::<ObserverAuditCounts>().recursive_same);
+    }
+
+    #[test]
+    fn observer_can_trigger_different_event_recursively() {
+        let mut world = World::new();
+        world.init_resource::<ObserverAuditCounts>();
+
+        world.add_observer(
+            |_: On<EventA>, mut counts: ResMut<ObserverAuditCounts>, mut commands: Commands| {
+                counts.recursive_a += 1;
+                commands.trigger(EventB);
+            },
+        );
+        world.add_observer(|_: On<EventB>, mut counts: ResMut<ObserverAuditCounts>| {
+            counts.recursive_b += 1;
+        });
+
+        world.trigger(EventA);
+        world.flush();
+
+        let counts = world.resource::<ObserverAuditCounts>();
+        assert_eq!(1, counts.recursive_a);
+        assert_eq!(1, counts.recursive_b);
+    }
+
+    #[test]
+    fn observer_registered_through_overlapping_component_routes_fires_once() {
+        let mut world = World::new();
+        world.init_resource::<ObserverAuditCounts>();
+        let entity = world.spawn_empty().id();
+        let component_a = world.register_component::<A>();
+        let component_b = world.register_component::<B>();
+
+        world.spawn(
+            Observer::new(
+                |_: On<EntityComponentsEvent, (A, B)>, mut counts: ResMut<ObserverAuditCounts>| {
+                    counts.duplicate += 1;
+                },
+            )
+            .with_entity(entity),
+        );
+
+        world.trigger_with(
+            EntityComponentsEvent(entity),
+            EntityComponentsTrigger {
+                components: &[component_a, component_b, component_a],
+                old_archetype: None,
+                new_archetype: None,
+            },
+        );
+
+        assert_eq!(1, world.resource::<ObserverAuditCounts>().duplicate);
     }
 
     #[test]
@@ -1547,11 +1747,8 @@ mod tests {
         observer.remove::<Observer>();
         let id = observer.id();
         let event_key = world.event_key::<EventA>().unwrap();
-        assert!(!world
-            .observers
-            .get_observers_mut(event_key)
-            .global_observers
-            .contains_key(&id));
+        assert!(world.observers.try_get_observers(event_key).is_none());
+        assert!(world.get_entity(id).is_ok());
     }
 
     #[test]

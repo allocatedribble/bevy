@@ -1,4 +1,5 @@
 use bevy_ecs::{
+    event::EntityComponentsTrigger,
     hierarchy::ChildOf,
     prelude::*,
     schedule::{
@@ -69,6 +70,13 @@ sparse_components!(
 
 #[derive(Event)]
 struct MicroscopeEvent;
+
+#[derive(EntityEvent)]
+struct MicroscopeEntityEvent(Entity);
+
+#[derive(EntityEvent)]
+#[entity_event(trigger = EntityComponentsTrigger<'a>)]
+struct MicroscopeEntityComponentsEvent(Entity);
 
 #[derive(Component)]
 struct TransitionMarker;
@@ -1256,6 +1264,149 @@ fn change_detection_filters(c: &mut Criterion) {
     group.finish();
 }
 
+fn observer_dispatch_pressure(c: &mut Criterion) {
+    let mut group = c.benchmark_group("ecs_microscope/observer_dispatch");
+    group.warm_up_time(core::time::Duration::from_millis(250));
+    group.measurement_time(core::time::Duration::from_secs(2));
+    group.sample_size(20);
+
+    group.bench_function("no_observers_global", |bencher| {
+        let mut world = World::new();
+        bencher.iter(|| world.trigger(MicroscopeEvent));
+    });
+
+    group.bench_function("global_observer", |bencher| {
+        let mut world = World::new();
+        world.add_observer(|event: On<MicroscopeEvent>| {
+            black_box(event);
+        });
+        bencher.iter(|| world.trigger(MicroscopeEvent));
+    });
+
+    group.bench_function("entity_observer", |bencher| {
+        let mut world = World::new();
+        let entity = world
+            .spawn_empty()
+            .observe(|event: On<MicroscopeEntityEvent>| {
+                black_box(event);
+            })
+            .id();
+        bencher.iter(|| world.trigger(MicroscopeEntityEvent(entity)));
+    });
+
+    group.bench_function("component_observer", |bencher| {
+        let mut world = World::new();
+        let entity = world.spawn_empty().id();
+        let component = world.register_component::<TableOnly>();
+        world.add_observer(|event: On<MicroscopeEntityComponentsEvent, TableOnly>| {
+            black_box(event);
+        });
+        bencher.iter(|| {
+            world.trigger_with(
+                MicroscopeEntityComponentsEvent(entity),
+                EntityComponentsTrigger {
+                    components: &[component],
+                    old_archetype: None,
+                    new_archetype: None,
+                },
+            );
+        });
+    });
+
+    group.bench_function("entity_component_observer", |bencher| {
+        let mut world = World::new();
+        let component = world.register_component::<TableOnly>();
+        let entity = world
+            .spawn_empty()
+            .observe(|event: On<MicroscopeEntityComponentsEvent, TableOnly>| {
+                black_box(event);
+            })
+            .id();
+        bencher.iter(|| {
+            world.trigger_with(
+                MicroscopeEntityComponentsEvent(entity),
+                EntityComponentsTrigger {
+                    components: &[component],
+                    old_archetype: None,
+                    new_archetype: None,
+                },
+            );
+        });
+    });
+
+    for observer_count in [1_000, 10_000] {
+        group.bench_with_input(
+            BenchmarkId::new("many_irrelevant_entity_observers", observer_count),
+            &observer_count,
+            |bencher, &observer_count| {
+                let mut world = World::new();
+                let target = world.spawn_empty().id();
+                for _ in 0..observer_count {
+                    world
+                        .spawn_empty()
+                        .observe(|event: On<MicroscopeEntityEvent>| {
+                            black_box(event);
+                        });
+                }
+                bencher.iter(|| world.trigger(MicroscopeEntityEvent(target)));
+            },
+        );
+    }
+
+    group.bench_function("lifecycle_add_no_observers", |bencher| {
+        bencher.iter_batched(
+            World::new,
+            |mut world| {
+                world.spawn(TableOnly(1));
+                black_box(world.entities().len());
+            },
+            BatchSize::SmallInput,
+        );
+    });
+
+    group.bench_function("lifecycle_add_with_observer_flags", |bencher| {
+        bencher.iter_batched(
+            || {
+                let mut world = World::new();
+                world.add_observer(|event: On<Add, TableOnly>| {
+                    black_box(event);
+                });
+                world
+            },
+            |mut world| {
+                world.spawn(TableOnly(1));
+                black_box(world.entities().len());
+            },
+            BatchSize::SmallInput,
+        );
+    });
+
+    for archetype_count in [1_000, 10_000] {
+        group.bench_with_input(
+            BenchmarkId::new("unregister_add_observer_many_archetypes", archetype_count),
+            &archetype_count,
+            |bencher, &archetype_count| {
+                bencher.iter_batched(
+                    || {
+                        let mut world = World::new();
+                        add_archetype_bits(&mut world, archetype_count);
+                        let observer = world.add_observer(|_: On<Add, A0>| {}).id();
+                        (world, observer)
+                    },
+                    |(mut world, observer)| {
+                        world.despawn(observer);
+                        world.flush();
+                        black_box(world.entities().len());
+                    },
+                    BatchSize::LargeInput,
+                );
+            },
+        );
+    }
+
+    group.finish();
+}
+
 fn observer_and_relationship_storms(c: &mut Criterion) {
     let mut group = c.benchmark_group("ecs_microscope/observer_relationship");
     group.warm_up_time(core::time::Duration::from_millis(250));
@@ -1323,6 +1474,7 @@ criterion_group!(
     scheduler_apply_deferred_frequency,
     change_detection_scan,
     change_detection_filters,
+    observer_dispatch_pressure,
     observer_and_relationship_storms,
 );
 criterion_main!(benches);

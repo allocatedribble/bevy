@@ -790,6 +790,11 @@ impl<'w> DeferredWorld<'w> {
             let world = self.as_unsafe_world_cell();
             let observers = world.observers();
             let Some(observers) = observers.try_get_observers(event_key) else {
+                crate::audit::observer_no_observers();
+                return;
+            };
+            if observers.is_empty() {
+                crate::audit::observer_no_observers();
                 return;
             };
             // SAFETY: The only outstanding reference to world is `observers`

@@ -55,7 +55,13 @@ mod imp {
         APPLY_DEFERRED_SYSTEMS,
         APPLY_DEFERRED_NANOS,
         OBSERVER_TRIGGERS,
+        OBSERVER_NO_OBSERVERS,
         OBSERVER_DISPATCHES,
+        OBSERVER_GLOBAL_DISPATCHES,
+        OBSERVER_ENTITY_DISPATCHES,
+        OBSERVER_COMPONENT_DISPATCHES,
+        OBSERVER_ENTITY_COMPONENT_DISPATCHES,
+        OBSERVER_DEDUPED,
         OBSERVER_MAX_TRIGGER_DEPTH,
         RELATIONSHIP_ADDS,
         RELATIONSHIP_REMOVES,
@@ -108,7 +114,13 @@ mod imp {
         pub apply_deferred_systems: usize,
         pub apply_deferred_nanos: usize,
         pub observer_triggers: usize,
+        pub observer_no_observers: usize,
         pub observer_dispatches: usize,
+        pub observer_global_dispatches: usize,
+        pub observer_entity_dispatches: usize,
+        pub observer_component_dispatches: usize,
+        pub observer_entity_component_dispatches: usize,
+        pub observer_deduped: usize,
         pub observer_max_trigger_depth: usize,
         pub relationship_adds: usize,
         pub relationship_removes: usize,
@@ -323,8 +335,42 @@ mod imp {
     }
 
     #[inline]
+    pub(crate) fn observer_no_observers() {
+        inc(&OBSERVER_NO_OBSERVERS);
+    }
+
+    #[inline]
     pub(crate) fn observer_dispatch() {
         inc(&OBSERVER_DISPATCHES);
+    }
+
+    #[inline]
+    pub(crate) fn observer_global_dispatch() {
+        observer_dispatch();
+        inc(&OBSERVER_GLOBAL_DISPATCHES);
+    }
+
+    #[inline]
+    pub(crate) fn observer_entity_dispatch() {
+        observer_dispatch();
+        inc(&OBSERVER_ENTITY_DISPATCHES);
+    }
+
+    #[inline]
+    pub(crate) fn observer_component_dispatch() {
+        observer_dispatch();
+        inc(&OBSERVER_COMPONENT_DISPATCHES);
+    }
+
+    #[inline]
+    pub(crate) fn observer_entity_component_dispatch() {
+        observer_dispatch();
+        inc(&OBSERVER_ENTITY_COMPONENT_DISPATCHES);
+    }
+
+    #[inline]
+    pub(crate) fn observer_deduped() {
+        inc(&OBSERVER_DEDUPED);
     }
 
     #[inline]
@@ -421,7 +467,13 @@ mod imp {
             apply_deferred_systems: load(&APPLY_DEFERRED_SYSTEMS),
             apply_deferred_nanos: load(&APPLY_DEFERRED_NANOS),
             observer_triggers: load(&OBSERVER_TRIGGERS),
+            observer_no_observers: load(&OBSERVER_NO_OBSERVERS),
             observer_dispatches: load(&OBSERVER_DISPATCHES),
+            observer_global_dispatches: load(&OBSERVER_GLOBAL_DISPATCHES),
+            observer_entity_dispatches: load(&OBSERVER_ENTITY_DISPATCHES),
+            observer_component_dispatches: load(&OBSERVER_COMPONENT_DISPATCHES),
+            observer_entity_component_dispatches: load(&OBSERVER_ENTITY_COMPONENT_DISPATCHES),
+            observer_deduped: load(&OBSERVER_DEDUPED),
             observer_max_trigger_depth: load(&OBSERVER_MAX_TRIGGER_DEPTH),
             relationship_adds: load(&RELATIONSHIP_ADDS),
             relationship_removes: load(&RELATIONSHIP_REMOVES),
@@ -534,7 +586,27 @@ mod imp {
         ObserverTriggerGuard
     }
     #[inline]
+    pub(crate) fn observer_no_observers() {}
+    #[inline]
     pub(crate) fn observer_dispatch() {}
+    #[inline]
+    pub(crate) fn observer_global_dispatch() {
+        observer_dispatch();
+    }
+    #[inline]
+    pub(crate) fn observer_entity_dispatch() {
+        observer_dispatch();
+    }
+    #[inline]
+    pub(crate) fn observer_component_dispatch() {
+        observer_dispatch();
+    }
+    #[inline]
+    pub(crate) fn observer_entity_component_dispatch() {
+        observer_dispatch();
+    }
+    #[inline]
+    pub(crate) fn observer_deduped() {}
     #[inline]
     pub(crate) fn relationship_add(_: usize) {}
     #[inline]
@@ -585,6 +657,9 @@ mod tests {
     #[derive(Event)]
     struct AuditEvent;
 
+    #[derive(Event)]
+    struct AuditNoObserverEvent;
+
     #[derive(Resource, Default)]
     struct AuditScheduleLog(usize);
 
@@ -629,6 +704,7 @@ mod tests {
 
         world.add_observer(|_: On<AuditEvent>| {});
         world.trigger(AuditEvent);
+        world.trigger(AuditNoObserverEvent);
 
         world.init_resource::<AuditScheduleLog>();
         let mut schedule = Schedule::default();
@@ -660,6 +736,8 @@ mod tests {
         assert!(counters.scheduler_apply_deferred_bitset_reuses > 0);
         assert!(counters.apply_deferred_calls > 0);
         assert!(counters.observer_dispatches >= 1);
+        assert!(counters.observer_global_dispatches >= 1);
+        assert!(counters.observer_no_observers >= 1);
         assert!(counters.observer_max_trigger_depth > 0);
         assert!(counters.change_tick_check_skipped_under_threshold > 0);
         assert!(counters.change_tick_checks > 0);

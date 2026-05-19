@@ -110,6 +110,22 @@ impl Observers {
             flags.insert(ArchetypeFlags::ON_DESPAWN_OBSERVER);
         }
     }
+
+    pub(crate) fn remove_empty_cache(&mut self, event_key: EventKey) {
+        use crate::lifecycle::*;
+
+        if matches!(event_key, ADD | INSERT | DISCARD | REMOVE | DESPAWN) {
+            return;
+        }
+
+        if self
+            .cache
+            .get(&event_key)
+            .is_some_and(CachedObservers::is_empty)
+        {
+            self.cache.remove(&event_key);
+        }
+    }
 }
 
 /// Collection of [`ObserverRunner`] for [`Observer`](crate::observer::Observer) registered to a particular event.
@@ -142,6 +158,13 @@ impl CachedObservers {
     pub fn entity_observers(&self) -> &EntityHashMap<ObserverMap> {
         &self.entity_observers
     }
+
+    /// Returns `true` if no observer runners are cached for this event.
+    pub fn is_empty(&self) -> bool {
+        self.global_observers.is_empty()
+            && self.component_observers.is_empty()
+            && self.entity_observers.is_empty()
+    }
 }
 
 /// Map between an observer entity and its [`ObserverRunner`]
@@ -167,5 +190,10 @@ impl CachedComponentObservers {
     /// Returns observers watching for events targeting this component on a specific entity
     pub fn entity_component_observers(&self) -> &EntityHashMap<ObserverMap> {
         &self.entity_component_observers
+    }
+
+    /// Returns `true` if no observer runners are cached for this component.
+    pub fn is_empty(&self) -> bool {
+        self.global_observers.is_empty() && self.entity_component_observers.is_empty()
     }
 }

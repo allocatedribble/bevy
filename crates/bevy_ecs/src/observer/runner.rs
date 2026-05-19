@@ -49,6 +49,7 @@ pub(super) unsafe fn observer_system_runner<E: Event, B: Bundle, S: ObserverSyst
     // TODO: Move this check into the observer cache to avoid dynamic dispatch
     let last_trigger = world.last_trigger_id();
     if state.last_trigger_id == last_trigger {
+        crate::audit::observer_deduped();
         return;
     }
     state.last_trigger_id = last_trigger;
