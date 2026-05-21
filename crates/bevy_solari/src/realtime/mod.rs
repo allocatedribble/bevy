@@ -31,7 +31,7 @@ use bevy_render::{
     ExtractSchedule, Render, RenderApp, RenderStartup, RenderSystems,
 };
 use bevy_shader::load_shader_library;
-use extract::extract_solari_lighting;
+use extract::{extract_removed_solari_lighting, extract_solari_lighting};
 use node::{init_solari_lighting_pipelines, solari_lighting};
 use prepare::prepare_solari_lighting_resources;
 use tracing::warn;
@@ -78,7 +78,10 @@ impl Plugin for SolariLightingPlugin {
 
         render_app
             .add_systems(RenderStartup, init_solari_lighting_pipelines)
-            .add_systems(ExtractSchedule, extract_solari_lighting)
+            .add_systems(
+                ExtractSchedule,
+                (extract_removed_solari_lighting, extract_solari_lighting).chain(),
+            )
             .add_systems(
                 Render,
                 prepare_solari_lighting_resources.in_set(RenderSystems::PrepareResources),

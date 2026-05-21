@@ -62,6 +62,7 @@ pub struct SolariLightingResources {
     pub world_cache_active_cells_count: Buffer,
     pub world_cache_active_cells_dispatch: Buffer,
     pub debug_mode: Buffer,
+    pub debug_mode_bits: u32,
     pub debug_counters: Buffer,
     pub view_size: UVec2,
 }
@@ -83,20 +84,20 @@ impl From<SolariDebugMode> for SolariDebugModeUniform {
 }
 
 pub fn prepare_solari_lighting_resources(
-    #[cfg(any(not(feature = "dlss"), feature = "force_disable_dlss"))] query: Query<
+    #[cfg(any(not(feature = "dlss"), feature = "force_disable_dlss"))] mut query: Query<
         (
             Entity,
             &ExtractedCamera,
-            Option<&SolariLightingResources>,
+            Option<&mut SolariLightingResources>,
             Option<&MainPassResolutionOverride>,
         ),
         With<SolariLighting>,
     >,
-    #[cfg(all(feature = "dlss", not(feature = "force_disable_dlss")))] query: Query<
+    #[cfg(all(feature = "dlss", not(feature = "force_disable_dlss")))] mut query: Query<
         (
             Entity,
             &ExtractedCamera,
-            Option<&SolariLightingResources>,
+            Option<&mut SolariLightingResources>,
             Option<&MainPassResolutionOverride>,
             Has<Dlss<DlssRayReconstructionFeature>>,
         ),
@@ -109,7 +110,7 @@ pub fn prepare_solari_lighting_resources(
 ) {
     let debug_mode = debug_mode.map(|mode| *mode).unwrap_or_default();
 
-    for query_item in &query {
+    for query_item in &mut query {
         #[cfg(any(not(feature = "dlss"), feature = "force_disable_dlss"))]
         let (entity, camera, solari_lighting_resources, resolution_override) = query_item;
         #[cfg(all(feature = "dlss", not(feature = "force_disable_dlss")))]
@@ -123,14 +124,18 @@ pub fn prepare_solari_lighting_resources(
             view_size = *resolution_override;
         }
 
-        if let Some(solari_lighting_resources) = solari_lighting_resources
+        if let Some(mut solari_lighting_resources) = solari_lighting_resources
             && solari_lighting_resources.view_size == view_size
         {
-            render_queue.write_buffer(
-                &solari_lighting_resources.debug_mode,
-                0,
-                bytemuck::bytes_of(&SolariDebugModeUniform::from(debug_mode)),
-            );
+            let debug_mode_bits = debug_mode.bits();
+            if solari_lighting_resources.debug_mode_bits != debug_mode_bits {
+                render_queue.write_buffer(
+                    &solari_lighting_resources.debug_mode,
+                    0,
+                    bytemuck::bytes_of(&SolariDebugModeUniform::from(debug_mode)),
+                );
+                solari_lighting_resources.debug_mode_bits = debug_mode_bits;
+            }
             continue;
         }
 
@@ -293,6 +298,7 @@ pub fn prepare_solari_lighting_resources(
             world_cache_active_cells_count,
             world_cache_active_cells_dispatch,
             debug_mode: debug_mode_buffer,
+            debug_mode_bits: debug_mode.bits(),
             debug_counters,
             view_size,
         });
